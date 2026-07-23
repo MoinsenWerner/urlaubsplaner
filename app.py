@@ -12,6 +12,7 @@ from flask import (
     Flask,
     abort,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -34,6 +35,23 @@ from werkzeug.utils import secure_filename
 DB_PATH = Path(os.environ.get("URLAUBSPLANER_DB", "instance/urlaubsplaner.sqlite3"))
 ROLE_ORDER = ["admin", "ausbilder", "putzchef", "azubi", "normal"]
 ROLE_RANK = {role: index for index, role in enumerate(ROLE_ORDER)}
+IGNORED_IMPORT_NAMES = {
+    "monat",
+    "kw",
+    "ferienzeit",
+    "geplant oder beantragt",
+    "genehmigt",
+    "feiertag",
+    "grundkurs",
+    "berufsschule",
+    "ausbildungsmesse",
+    "pv+ba+ap",
+    "ausbildung",
+    "weihnachtsputz",
+    "kurzarbeit",
+    "weiterbildung",
+    "kein arbeitstag",
+}
 ENTRY_TYPES = {
     "UB": ("Urlaub geplant/beantragt", "FFFF00"),
     "UG": ("Genehmigter Urlaub", "90EE90"),
@@ -223,6 +241,52 @@ def visible_code(
     return code if viewer.has_role("admin") else "", color
 
 
+def month_spans(days: list[date]) -> list[dict[str, int | str]]:
+    spans = []
+    previous = None
+    for day in days:
+        key = (day.year, day.month)
+        if key != previous:
+            spans.append({"label": day.strftime("%b"), "span": 1})
+            previous = key
+        else:
+            spans[-1]["span"] += 1
+    return spans
+
+
+def year_spans(days: list[date]) -> list[dict[str, int | str]]:
+    spans = []
+    previous = None
+    for day in days:
+        if day.year != previous:
+            spans.append({"label": str(day.year), "span": 1})
+            previous = day.year
+        else:
+            spans[-1]["span"] += 1
+    return spans
+
+
+def cell_style_and_tooltip(
+    viewer: User,
+    target_user_id: int,
+    target_roles: list[str],
+    day: date,
+    codes: list[str],
+) -> tuple[str, str]:
+    if not codes:
+        return "", ""
+    code = codes[-1]
+    label, default_color = ENTRY_TYPES[code]
+    _, color = visible_code(viewer, target_user_id, target_roles, code)
+    if viewer.has_role("admin"):
+        entry_text = f"{code} – {label}"
+    elif code == "KR" and color != SPECIAL_KR:
+        entry_text = "Abwesend"
+    else:
+        entry_text = label
+    return default_color if code != "KR" else color, f"{day:%d.%m.%Y}: {entry_text}"
+
+
 def school_vacations_bavaria(years: set[int]) -> dict[str, str]:
     # Ferien nach bayerischem Ferienkalender; feste Berechnung für Schuljahre 2025-2027.
     ranges = {
@@ -334,6 +398,9 @@ def index():
         allowed_codes=allowed_codes(current_user),
         today_monday=today_monday,
         visible_code=visible_code,
+        cell_style_and_tooltip=cell_style_and_tooltip,
+        month_spans=month_spans(days),
+        year_spans=year_spans(days),
         year=year,
         german_weekdays=GERMAN_WEEKDAYS,
     )
@@ -359,6 +426,48 @@ def entry():
                 (target_id, entry_date, code, current_user.id),
             )
     return redirect(request.referrer or url_for("index"))
+
+
+@app.post("/bulk-entry")
+@login_required
+def bulk_entry():
+    payload = request.get_json(silent=True) or {}
+    cells = payload.get("cells", [])
+    code = payload.get("code")
+    delete = payload.get("delete", False)
+    if not cells:
+        return jsonify({"updated": 0})
+    if not delete and code not in ENTRY_TYPES:
+        abort(400)
+    updated = 0
+    with db() as conn:
+        for cell in cells:
+            target_id = int(cell["user_id"])
+            entry_date = cell["date"]
+            if delete:
+                removable_codes = (
+                    ENTRY_TYPES
+                    if current_user.has_role("admin")
+                    else allowed_codes(current_user)
+                )
+                for removable_code in removable_codes:
+                    if may_edit(current_user, target_id, removable_code):
+                        cur = conn.execute(
+                            "DELETE FROM entries WHERE user_id = ? AND entry_date = ? AND code = ?",
+                            (target_id, entry_date, removable_code),
+                        )
+                        updated += cur.rowcount
+            elif may_edit(current_user, target_id, code):
+                conn.execute(
+                    "DELETE FROM entries WHERE user_id = ? AND entry_date = ?",
+                    (target_id, entry_date),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO entries(user_id, entry_date, code, created_by) VALUES (?, ?, ?, ?)",
+                    (target_id, entry_date, code, current_user.id),
+                )
+                updated += 1
+    return jsonify({"updated": updated})
 
 
 @app.route("/members", methods=["GET", "POST"])
@@ -526,11 +635,13 @@ def import_excel(path: Path) -> None:
                 except ValueError:
                     pass
         dates.append(parsed)
+    actor_id = getattr(current_user, "id", None)
     with db() as conn:
         for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row[0] or str(row[0]).lower() == "ferien":
+            row_label = str(row[0]).strip() if row[0] else ""
+            if not row_label or row_label.lower() in IGNORED_IMPORT_NAMES:
                 continue
-            parts = str(row[0]).split()
+            parts = row_label.split()
             first, last = (parts[0], " ".join(parts[1:]) or parts[0])
             username = f"{first}.{last}".lower().replace(" ", ".")
             user = conn.execute(
@@ -546,7 +657,12 @@ def import_excel(path: Path) -> None:
                 if code in ENTRY_TYPES and dates[idx]:
                     conn.execute(
                         "INSERT OR IGNORE INTO entries(user_id, entry_date, code, created_by) VALUES (?, ?, ?, ?)",
-                        (user_id, dates[idx].isoformat(), code, current_user.id),
+                        (
+                            user_id,
+                            dates[idx].isoformat(),
+                            code,
+                            actor_id,
+                        ),
                     )
 
 
@@ -562,4 +678,4 @@ def ensure_database():
 
 if __name__ == "__main__":
     init_db()
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=4010, debug=True)

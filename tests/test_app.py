@@ -100,3 +100,61 @@ def test_weekdays_and_band_ranges(client):
     assert (start, end) == (date(2025, 7, 2), date(2027, 7, 2))
     days = vacation_app.weekdays_between(date(2026, 1, 1), date(2026, 1, 7))
     assert [day.weekday() for day in days] == [3, 4, 0, 1, 2]
+
+
+def test_bulk_entry_overwrites_and_deletes_selection(client):
+    login(client)
+    today = date.today().isoformat()
+    add = client.post(
+        "/bulk-entry",
+        json={"code": "UB", "cells": [{"user_id": 1, "date": today}]},
+    )
+    assert add.status_code == 200
+    overwrite = client.post(
+        "/bulk-entry",
+        json={"code": "UG", "cells": [{"user_id": 1, "date": today}]},
+    )
+    assert overwrite.json["updated"] == 1
+    with vacation_app.db() as conn:
+        codes = [
+            row["code"]
+            for row in conn.execute(
+                "SELECT code FROM entries WHERE user_id = 1 AND entry_date = ?",
+                (today,),
+            )
+        ]
+    assert codes == ["UG"]
+    delete = client.post(
+        "/bulk-entry", json={"delete": True, "cells": [{"user_id": 1, "date": today}]}
+    )
+    assert delete.status_code == 200
+    with vacation_app.db() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE user_id = 1 AND entry_date = ?",
+            (today,),
+        ).fetchone()[0]
+    assert count == 0
+
+
+def test_import_ignores_excel_labels(client, tmp_path):
+    login(client)
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Name", date.today()])
+    ws.append(["Monat", None])
+    ws.append(["Geplant oder Beantragt", None])
+    ws.append(["Erika Mustermann", "UB"])
+    path = tmp_path / "import.xlsx"
+    wb.save(path)
+    with client:
+        vacation_app.import_excel(path)
+    with vacation_app.db() as conn:
+        names = [
+            row["username"]
+            for row in conn.execute("SELECT username FROM users ORDER BY id")
+        ]
+    assert "monat" not in names
+    assert "geplant.oder.beantragt" not in names
+    assert "erika.mustermann" in names
