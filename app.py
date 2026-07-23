@@ -68,6 +68,23 @@ ENTRY_TYPES = {
     "KAT": ("Kein Arbeitstag", "000000"),
     "KR": ("Krank", "90EE90"),
 }
+IMPORT_VALUE_TO_CODE = {
+    "UrlbGplntOdrBntrgt": "UB",
+    "UrlbGnhmgt": "UG",
+    "Frtg": None,
+    "Grndkrs": "GK",
+    "Brfsschl": "BS",
+    "Asbldngsmss": "AM",
+    "PvBaAp": "PV",
+    "Asbldng": "AZ",
+    "Whnchtsptz": "WP",
+    "Krzrbt": "KA",
+    "Wtrbldng": "WB",
+    "KnArbtstg": "KAT",
+}
+IMPORT_VALUE_TO_CODE_NORMALIZED = {
+    key.casefold(): value for key, value in IMPORT_VALUE_TO_CODE.items()
+}
 SPECIAL_KR = "00FE43"
 HOLIDAY_COLOR = "ADD8E6"
 VACATION_COLOR = "BDD7EE"
@@ -653,8 +670,9 @@ def import_excel(path: Path) -> None:
                 else create_user(conn, username, first, last, "changeme", ["normal"])
             )
             for idx, value in enumerate(row[1:]):
-                code = str(value).strip().upper() if value else ""
-                if code in ENTRY_TYPES and dates[idx]:
+                raw_value = str(value).strip() if value else ""
+                code = IMPORT_VALUE_TO_CODE_NORMALIZED.get(raw_value.casefold())
+                if code and dates[idx]:
                     conn.execute(
                         "INSERT OR IGNORE INTO entries(user_id, entry_date, code, created_by) VALUES (?, ?, ?, ?)",
                         (

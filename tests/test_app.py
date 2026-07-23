@@ -145,7 +145,8 @@ def test_import_ignores_excel_labels(client, tmp_path):
     ws.append(["Name", date.today()])
     ws.append(["Monat", None])
     ws.append(["Geplant oder Beantragt", None])
-    ws.append(["Erika Mustermann", "UB"])
+    ws.append(["Erika Mustermann", "UrlbGplntOdrBntrgt"])
+    ws.append(["Felix Feiertag", "Frtg"])
     path = tmp_path / "import.xlsx"
     wb.save(path)
     with client:
@@ -158,3 +159,18 @@ def test_import_ignores_excel_labels(client, tmp_path):
     assert "monat" not in names
     assert "geplant.oder.beantragt" not in names
     assert "erika.mustermann" in names
+    assert "felix.feiertag" in names
+    with vacation_app.db() as conn:
+        imported_codes = [
+            row["code"]
+            for row in conn.execute(
+                "SELECT e.code FROM entries e JOIN users u ON u.id = e.user_id WHERE u.username = ?",
+                ("erika.mustermann",),
+            )
+        ]
+        feiertag_count = conn.execute(
+            "SELECT COUNT(*) FROM entries e JOIN users u ON u.id = e.user_id WHERE u.username = ?",
+            ("felix.feiertag",),
+        ).fetchone()[0]
+    assert imported_codes == ["UB"]
+    assert feiertag_count == 0
