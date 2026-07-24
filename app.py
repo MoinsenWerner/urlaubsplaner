@@ -85,6 +85,20 @@ IMPORT_VALUE_TO_CODE = {
 IMPORT_VALUE_TO_CODE_NORMALIZED = {
     key.casefold(): value for key, value in IMPORT_VALUE_TO_CODE.items()
 }
+IMPORT_LEGEND_LABEL_TO_CODE = {
+    "geplant oder beantragt": "UB",
+    "genehmigt": "UG",
+    "feiertag": None,
+    "grundkurs": "GK",
+    "berufsschule": "BS",
+    "ausbildungsmesse": "AM",
+    "pv+ba+ap": "PV",
+    "ausbildung": "AZ",
+    "weihnachtsputz": "WP",
+    "kurzarbeit": "KA",
+    "weiterbildung": "WB",
+    "kein arbeitstag": "KAT",
+}
 SPECIAL_KR = "00FE43"
 HOLIDAY_COLOR = "ADD8E6"
 VACATION_COLOR = "BDD7EE"
@@ -633,6 +647,32 @@ def upload():
     return render_template("upload.html")
 
 
+def excel_fill_key(cell) -> tuple | None:
+    fill = cell.fill
+    if not fill or fill.fill_type != "solid":
+        return None
+    color = fill.fgColor
+    if color.type == "rgb" and color.rgb and color.rgb != "00000000":
+        return ("rgb", color.rgb.upper())
+    if color.type == "indexed" and color.indexed is not None:
+        return ("indexed", color.indexed)
+    if color.type == "theme" and color.theme is not None:
+        return ("theme", color.theme, color.tint)
+    return None
+
+
+def build_legend_fill_map(ws) -> dict[tuple, str | None]:
+    result = {}
+    for row in ws.iter_rows():
+        label = str(row[0].value).strip().casefold() if row[0].value else ""
+        if label not in IMPORT_LEGEND_LABEL_TO_CODE:
+            continue
+        fill_key = excel_fill_key(row[0])
+        if fill_key:
+            result[fill_key] = IMPORT_LEGEND_LABEL_TO_CODE[label]
+    return result
+
+
 def parse_excel_date(value) -> date | None:
     if isinstance(value, datetime):
         return value.date()
@@ -648,6 +688,61 @@ def parse_excel_date(value) -> date | None:
     return None
 
 
+GERMAN_MONTHS = {
+    "jan": 1,
+    "januar": 1,
+    "februar": 2,
+    "märz": 3,
+    "maerz": 3,
+    "april": 4,
+    "mai": 5,
+    "juni": 6,
+    "juli": 7,
+    "august": 8,
+    "september": 9,
+    "oktober": 10,
+    "november": 11,
+    "dezember": 12,
+}
+
+
+def reconstruct_dates_from_excel_headers(ws) -> tuple[int, dict[int, date]]:
+    month_row = None
+    day_row = None
+    for row in ws.iter_rows(min_col=1, max_col=1):
+        label = str(row[0].value).strip().casefold() if row[0].value else ""
+        if label == "monat":
+            month_row = row[0].row
+        elif label == "ferienzeit":
+            day_row = row[0].row
+    if not month_row or not day_row:
+        return 1, {}
+    dates = {}
+    current_year = None
+    current_month = None
+    for col in range(2, ws.max_column + 1):
+        marker = ws.cell(month_row, col).value
+        if isinstance(marker, int) and 2000 <= marker <= 2100:
+            current_year = marker
+        elif isinstance(marker, str):
+            month = GERMAN_MONTHS.get(marker.strip().casefold())
+            if month:
+                current_month = month
+        parsed = parse_excel_date(ws.cell(day_row, col).value)
+        if parsed:
+            dates[col] = parsed
+            current_year = parsed.year
+            current_month = parsed.month
+            continue
+        day_value = ws.cell(day_row, col).value
+        if current_year and current_month and isinstance(day_value, int):
+            try:
+                dates[col] = date(current_year, current_month, day_value)
+            except ValueError:
+                pass
+    return day_row, dates
+
+
 def find_excel_date_columns(ws) -> tuple[int, dict[int, date]]:
     best_row = 1
     best_dates: dict[int, date] = {}
@@ -660,6 +755,9 @@ def find_excel_date_columns(ws) -> tuple[int, dict[int, date]]:
         if len(dates) > len(best_dates):
             best_row = row[0].row
             best_dates = dates
+    reconstructed_row, reconstructed_dates = reconstruct_dates_from_excel_headers(ws)
+    if len(reconstructed_dates) > len(best_dates):
+        return reconstructed_row, reconstructed_dates
     return best_row, best_dates
 
 
@@ -667,6 +765,7 @@ def import_excel(path: Path) -> None:
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     date_row, date_columns = find_excel_date_columns(ws)
+    legend_fill_map = build_legend_fill_map(ws)
     actor_id = getattr(current_user, "id", None)
     with db() as conn:
         for row in ws.iter_rows(min_row=date_row + 1):
@@ -688,6 +787,8 @@ def import_excel(path: Path) -> None:
                 entry_date = date_columns.get(cell.column)
                 raw_value = str(cell.value).strip() if cell.value else ""
                 code = IMPORT_VALUE_TO_CODE_NORMALIZED.get(raw_value.casefold())
+                if code is None and raw_value.replace("\xa0", "") == "":
+                    code = legend_fill_map.get(excel_fill_key(cell))
                 if code and entry_date:
                     conn.execute(
                         "INSERT OR IGNORE INTO entries(user_id, entry_date, code, created_by) VALUES (?, ?, ?, ?)",

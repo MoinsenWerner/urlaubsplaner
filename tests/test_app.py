@@ -1,4 +1,5 @@
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -176,3 +177,18 @@ def test_import_ignores_excel_labels(client, tmp_path):
         ).fetchone()[0]
     assert imported_codes == ["UB"]
     assert feiertag_count == 0
+
+
+def test_repo_example_excel_imports_entries(client):
+    login(client)
+    example = (
+        Path(__file__).resolve().parents[1] / "Urlaubsübersicht-Detaillierung.xlsx"
+    )
+    vacation_app.import_excel(example)
+    with vacation_app.db() as conn:
+        entry_count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        imported_user = conn.execute(
+            "SELECT id FROM users WHERE username = ?", ("alexander.hälter",)
+        ).fetchone()
+    assert imported_user is not None
+    assert entry_count > 100
