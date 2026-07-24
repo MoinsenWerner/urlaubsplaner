@@ -142,8 +142,10 @@ def test_import_ignores_excel_labels(client, tmp_path):
 
     wb = Workbook()
     ws = wb.active
+    ws.append(["Monat", "Juli"])
+    ws.append(["KW", 30])
+    ws.append(["Ferienzeit", None])
     ws.append(["Name", date.today()])
-    ws.append(["Monat", None])
     ws.append(["Geplant oder Beantragt", None])
     ws.append(["Erika Mustermann", "UrlbGplntOdrBntrgt"])
     ws.append(["Felix Feiertag", "Frtg"])

@@ -633,29 +633,44 @@ def upload():
     return render_template("upload.html")
 
 
+def parse_excel_date(value) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text[-10:], fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def find_excel_date_columns(ws) -> tuple[int, dict[int, date]]:
+    best_row = 1
+    best_dates: dict[int, date] = {}
+    for row in ws.iter_rows():
+        dates = {}
+        for cell in row[1:]:
+            parsed = parse_excel_date(cell.value)
+            if parsed:
+                dates[cell.column] = parsed
+        if len(dates) > len(best_dates):
+            best_row = row[0].row
+            best_dates = dates
+    return best_row, best_dates
+
+
 def import_excel(path: Path) -> None:
     wb = load_workbook(path, data_only=True)
     ws = wb.active
-    headers = [cell.value for cell in ws[1]]
-    dates = []
-    for value in headers[1:]:
-        parsed = None
-        if isinstance(value, datetime):
-            parsed = value.date()
-        elif isinstance(value, date):
-            parsed = value
-        elif isinstance(value, str):
-            for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
-                try:
-                    parsed = datetime.strptime(value[-10:], fmt).date()
-                    break
-                except ValueError:
-                    pass
-        dates.append(parsed)
+    date_row, date_columns = find_excel_date_columns(ws)
     actor_id = getattr(current_user, "id", None)
     with db() as conn:
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            row_label = str(row[0]).strip() if row[0] else ""
+        for row in ws.iter_rows(min_row=date_row + 1):
+            row_label = str(row[0].value).strip() if row[0].value else ""
             if not row_label or row_label.lower() in IGNORED_IMPORT_NAMES:
                 continue
             parts = row_label.split()
@@ -669,15 +684,16 @@ def import_excel(path: Path) -> None:
                 if user
                 else create_user(conn, username, first, last, "changeme", ["normal"])
             )
-            for idx, value in enumerate(row[1:]):
-                raw_value = str(value).strip() if value else ""
+            for cell in row[1:]:
+                entry_date = date_columns.get(cell.column)
+                raw_value = str(cell.value).strip() if cell.value else ""
                 code = IMPORT_VALUE_TO_CODE_NORMALIZED.get(raw_value.casefold())
-                if code and dates[idx]:
+                if code and entry_date:
                     conn.execute(
                         "INSERT OR IGNORE INTO entries(user_id, entry_date, code, created_by) VALUES (?, ?, ?, ?)",
                         (
                             user_id,
-                            dates[idx].isoformat(),
+                            entry_date.isoformat(),
                             code,
                             actor_id,
                         ),
