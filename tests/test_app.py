@@ -22,6 +22,37 @@ def login(client, username="admin", password="admin"):
     )
 
 
+def create_initial_member(client, username="azubi", roles=None):
+    client.post(
+        "/members",
+        data={
+            "action": "create",
+            "username": username,
+            "first_name": username.title(),
+            "last_name": "Muster",
+            "roles": roles or ["normal"],
+        },
+    )
+    with vacation_app.db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        return row["id"], vacation_app.reveal_initial_password(row)
+
+
+def activate_member(client, username, initial_password, new_password="new-secret"):
+    return client.post(
+        "/initial-login",
+        data={
+            "username": username,
+            "initial_password": initial_password,
+            "new_password": new_password,
+            "password_confirmation": new_password,
+        },
+        follow_redirects=True,
+    )
+
+
 def test_admin_seed_and_login(client):
     response = login(client)
     assert response.status_code == 200
@@ -37,7 +68,6 @@ def test_admin_can_create_user_with_multiple_roles(client):
             "username": "max",
             "first_name": "Max",
             "last_name": "Muster",
-            "password": "secret",
             "roles": ["azubi", "normal"],
         },
         follow_redirects=True,
@@ -51,23 +81,22 @@ def test_admin_can_create_user_with_multiple_roles(client):
             )
         ]
     assert roles == ["azubi", "normal"]
+    with vacation_app.db() as conn:
+        user = conn.execute("SELECT * FROM users WHERE id = 2").fetchone()
+    password = vacation_app.reveal_initial_password(user)
+    assert len(password) == 8
+    assert user["must_change_password"] == 1
+    assert password.encode() in response.data
 
 
 def test_role_based_edit_permissions(client):
     login(client)
-    client.post(
-        "/members",
-        data={
-            "action": "create",
-            "username": "azubi",
-            "first_name": "Ada",
-            "last_name": "Azubi",
-            "password": "pw",
-            "roles": ["azubi"],
-        },
-    )
+    _, initial = create_initial_member(client, roles=["azubi"])
     client.get("/logout")
-    login(client, "azubi", "pw")
+    forced = login(client, "azubi", initial)
+    assert b"Initiales Passwort" in forced.data
+    activate_member(client, "azubi", initial)
+    login(client, "azubi", "new-secret")
     assert (
         client.post(
             "/entry",
@@ -177,6 +206,90 @@ def test_import_ignores_excel_labels(client, tmp_path):
         ).fetchone()[0]
     assert imported_codes == ["UB"]
     assert feiertag_count == 0
+
+
+def test_initial_link_and_password_reset(client):
+    login(client)
+    user_id, initial = create_initial_member(client, "lina", ["normal"])
+    link = vacation_app.initial_link("lina", initial)
+    client.get("/logout")
+    response = client.get(link.replace("https://urlaub.extrahelden.de", ""))
+    assert b'value="lina"' in response.data
+    assert initial.encode() in response.data
+
+    login(client)
+    response = client.post(
+        "/members",
+        data={"action": "reset-password", "user_id": user_id},
+    )
+    assert b"Neu erstellte Initialdatenanzeige" in response.data
+    blocked = client.get("/", follow_redirects=True)
+    assert b"Neu erstellte Initialdatenanzeige" in blocked.data
+    acknowledged = client.post(
+        "/members/acknowledge-initial-data", json={"user_id": user_id}
+    )
+    assert acknowledged.json == {"ok": True}
+    assert client.get("/").status_code == 200
+    with vacation_app.db() as conn:
+        reset_user = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    assert vacation_app.reveal_initial_password(reset_user) != initial
+
+
+def test_bulk_roles_and_ausbilder_may_only_reset_azubi(client):
+    login(client)
+    azubi_id, _ = create_initial_member(client, "lea", ["azubi"])
+    normal_id, _ = create_initial_member(client, "tom", ["normal"])
+    trainer_id, trainer_initial = create_initial_member(
+        client, "trainer", ["ausbilder"]
+    )
+    client.post(
+        "/members",
+        data={
+            "action": "roles-bulk",
+            "roles_1": ["admin"],
+            f"roles_{azubi_id}": ["azubi", "normal"],
+            f"roles_{normal_id}": ["putzchef"],
+            f"roles_{trainer_id}": ["ausbilder"],
+        },
+    )
+    with vacation_app.db() as conn:
+        assert vacation_app.roles_for_users(conn)[normal_id] == ["putzchef"]
+    client.get("/logout")
+    activate_member(client, "trainer", trainer_initial)
+    login(client, "trainer", "new-secret")
+    assert (
+        client.post(
+            "/members", data={"action": "reset-password", "user_id": azubi_id}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/members", data={"action": "reset-password", "user_id": normal_id}
+        ).status_code
+        == 403
+    )
+
+
+def test_profile_email_is_required_and_immutable(client):
+    login(client)
+    missing = client.post("/profile", data={"email": "", "birth_date": ""})
+    assert b"Pflichtangabe" in missing.data
+    saved = client.post(
+        "/profile",
+        data={"email": "admin@example.de", "birth_date": "1990-04-12"},
+        follow_redirects=True,
+    )
+    assert b"admin@example.de" in saved.data
+    client.post("/profile", data={"email": "changed@example.de", "birth_date": ""})
+    with vacation_app.db() as conn:
+        row = conn.execute(
+            "SELECT email, birth_date FROM users WHERE id = 1"
+        ).fetchone()
+    assert row["email"] == "admin@example.de"
+    assert row["birth_date"] is None
 
 
 def test_repo_example_excel_imports_entries(client):

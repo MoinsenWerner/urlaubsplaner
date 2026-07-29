@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import base64
+import hashlib
+import secrets
 import sqlite3
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -8,6 +11,7 @@ from io import BytesIO
 from pathlib import Path
 
 import holidays
+from cryptography.fernet import Fernet, InvalidToken
 from flask import (
     Flask,
     abort,
@@ -17,6 +21,8 @@ from flask import (
     render_template,
     request,
     send_file,
+    send_from_directory,
+    session,
     url_for,
 )
 from flask_login import (
@@ -114,6 +120,7 @@ GERMAN_WEEKDAYS = ["Mo", "Di", "Mi", "Do", "Fr"]
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-change-me")
 app.config["UPLOAD_FOLDER"] = "instance/uploads"
+app.config["PROFILE_UPLOAD_FOLDER"] = "instance/profile-images"
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
@@ -125,6 +132,7 @@ class User(UserMixin):
         self.last_name = row["last_name"]
         self.username = row["username"]
         self.password_hash = row["password_hash"]
+        self.must_change_password = bool(row["must_change_password"])
         self.roles = roles
 
     def has_role(self, role: str) -> bool:
@@ -170,6 +178,18 @@ def init_db() -> None:
             );
             """
         )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        migrations = {
+            "must_change_password": "INTEGER NOT NULL DEFAULT 0",
+            "initial_password_encrypted": "TEXT",
+            "initial_data_acknowledged": "INTEGER NOT NULL DEFAULT 1",
+            "email": "TEXT",
+            "birth_date": "TEXT",
+            "profile_image": "TEXT",
+        }
+        for column, definition in migrations.items():
+            if column not in columns:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             user_id = create_user(
                 conn, "admin", "Admin", "Benutzer", "admin", ["admin"]
@@ -193,6 +213,50 @@ def create_user(
             "INSERT INTO user_roles(user_id, role) VALUES (?, ?)", (user_id, role)
         )
     return user_id
+
+
+def initial_password() -> str:
+    """Create an eight-character password without ambiguous characters."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def credential_cipher() -> Fernet:
+    key = hashlib.sha256(app.config["SECRET_KEY"].encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def create_initial_user(
+    conn, username: str, first: str, last: str, roles: list[str]
+) -> tuple[int, str]:
+    password = initial_password()
+    encrypted = credential_cipher().encrypt(password.encode()).decode()
+    cur = conn.execute(
+        """INSERT INTO users(
+            username, first_name, last_name, password_hash,
+            must_change_password, initial_password_encrypted,
+            initial_data_acknowledged
+        ) VALUES (?, ?, ?, ?, 1, ?, 0)""",
+        (username, first, last, generate_password_hash(password), encrypted),
+    )
+    user_id = cur.lastrowid
+    for role in normalized_roles(roles):
+        conn.execute(
+            "INSERT INTO user_roles(user_id, role) VALUES (?, ?)", (user_id, role)
+        )
+    return user_id, password
+
+
+def reveal_initial_password(row: sqlite3.Row) -> str:
+    return (
+        credential_cipher().decrypt(row["initial_password_encrypted"].encode()).decode()
+    )
+
+
+def initial_link(username: str, password: str) -> str:
+    payload = f"{username}\0{password}".encode()
+    token = credential_cipher().encrypt(payload).decode()
+    return f"https://urlaub.extrahelden.de/initial-login?token={token}"
 
 
 def normalized_roles(roles: list[str]) -> list[str]:
@@ -385,16 +449,136 @@ def login():
             ).fetchone()
         if row and check_password_hash(row["password_hash"], request.form["password"]):
             login_user(load_user(str(row["id"])))
+            if row["must_change_password"]:
+                return redirect(url_for("initial_login"))
             return redirect(url_for("index"))
         flash("Ungültige Zugangsdaten.")
     return render_template("login.html")
+
+
+@app.route("/initial-login", methods=["GET", "POST"])
+def initial_login():
+    username = ""
+    password = ""
+    token = request.args.get("token", "")
+    if token:
+        try:
+            username, password = (
+                credential_cipher().decrypt(token.encode()).decode().split("\0", 1)
+            )
+        except (InvalidToken, ValueError):
+            flash("Der Initial-Link ist ungültig oder abgelaufen.")
+    if request.method == "POST":
+        username = request.form["username"].strip()
+        password = request.form["initial_password"]
+        new_password = request.form["new_password"]
+        if new_password != request.form["password_confirmation"]:
+            flash("Die neuen Passwörter stimmen nicht überein.")
+        elif len(new_password) < 8:
+            flash("Das neue Passwort muss mindestens 8 Zeichen lang sein.")
+        else:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM users WHERE username = ?", (username,)
+                ).fetchone()
+                if (
+                    row
+                    and row["must_change_password"]
+                    and check_password_hash(row["password_hash"], password)
+                ):
+                    conn.execute(
+                        """UPDATE users SET password_hash = ?, must_change_password = 0,
+                           initial_password_encrypted = NULL WHERE id = ?""",
+                        (generate_password_hash(new_password), row["id"]),
+                    )
+                    logout_user()
+                    flash("Passwort gespeichert. Du kannst dich jetzt anmelden.")
+                    return redirect(url_for("login"))
+            flash("Benutzername oder Initialpasswort ist ungültig.")
+    return render_template(
+        "initial-login.html", username=username, initial_password=password
+    )
 
 
 @app.route("/logout")
 @login_required
 def logout():
     logout_user()
+    session.pop("pending_initial_user_id", None)
     return redirect(url_for("login"))
+
+
+@app.route("/profile", methods=["GET", "POST"])
+@login_required
+def profile():
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (current_user.id,)
+        ).fetchone()
+        if request.method == "POST":
+            email = (row["email"] or request.form.get("email", "")).strip()
+            if not email:
+                flash("Die E-Mail-Adresse ist eine Pflichtangabe.")
+                return render_template("profile.html", profile=row)
+            birth_date = request.form.get("birth_date") or None
+            if birth_date:
+                try:
+                    date.fromisoformat(birth_date)
+                except ValueError:
+                    flash("Das Geburtsdatum ist ungültig.")
+                    return render_template("profile.html", profile=row)
+            image_name = row["profile_image"]
+            image = request.files.get("profile_image")
+            if image and image.filename:
+                suffix = Path(secure_filename(image.filename)).suffix.lower()
+                if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                    flash("Bitte lade ein Bild im Format JPG, PNG, WEBP oder GIF hoch.")
+                    return render_template("profile.html", profile=row)
+                Path(app.config["PROFILE_UPLOAD_FOLDER"]).mkdir(
+                    parents=True, exist_ok=True
+                )
+                image_name = f"user-{current_user.id}{suffix}"
+                image.save(Path(app.config["PROFILE_UPLOAD_FOLDER"]) / image_name)
+            conn.execute(
+                "UPDATE users SET email = ?, birth_date = ?, profile_image = ? WHERE id = ?",
+                (email, birth_date, image_name, current_user.id),
+            )
+            flash("Profil gespeichert.")
+            return redirect(url_for("profile"))
+    return render_template("profile.html", profile=row)
+
+
+@app.route("/profile-image/<path:filename>")
+@login_required
+def profile_image(filename: str):
+    return send_from_directory(app.config["PROFILE_UPLOAD_FOLDER"], filename)
+
+
+@app.route("/change-password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    if request.method == "POST":
+        with db() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (current_user.id,)
+            ).fetchone()
+            new_password = request.form["new_password"]
+            if not check_password_hash(
+                row["password_hash"], request.form["current_password"]
+            ):
+                flash("Das aktuelle Passwort ist falsch.")
+            elif new_password != request.form["password_confirmation"]:
+                flash("Die neuen Passwörter stimmen nicht überein.")
+            elif len(new_password) < 8:
+                flash("Das neue Passwort muss mindestens 8 Zeichen lang sein.")
+            else:
+                conn.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    (generate_password_hash(new_password), current_user.id),
+                )
+                flash("Passwort geändert.")
+                return redirect(url_for("profile"))
+    return render_template("change-password.html")
 
 
 @app.route("/")
@@ -504,40 +688,125 @@ def bulk_entry():
 @app.route("/members", methods=["GET", "POST"])
 @login_required
 def members():
-    if not current_user.has_role("admin"):
+    if not (current_user.has_role("admin") or current_user.has_role("ausbilder")):
         abort(403)
+    credentials = None
     with db() as conn:
         if request.method == "POST":
             action = request.form["action"]
             if action == "create":
-                create_user(
+                if not current_user.has_role("admin"):
+                    abort(403)
+                user_id, password = create_initial_user(
                     conn,
                     request.form["username"],
                     request.form["first_name"],
                     request.form["last_name"],
-                    request.form["password"],
                     request.form.getlist("roles"),
                 )
+                credentials = credential_details(conn, user_id, password)
+                session["pending_initial_user_id"] = user_id
             elif action == "delete":
+                if not current_user.has_role("admin"):
+                    abort(403)
                 conn.execute(
                     "DELETE FROM users WHERE id = ?", (request.form["user_id"],)
                 )
-            elif action == "roles":
-                conn.execute(
-                    "DELETE FROM user_roles WHERE user_id = ?",
-                    (request.form["user_id"],),
-                )
-                for role in normalized_roles(request.form.getlist("roles")):
+            elif action == "roles-bulk":
+                if not current_user.has_role("admin"):
+                    abort(403)
+                for user in get_users(conn):
                     conn.execute(
-                        "INSERT INTO user_roles(user_id, role) VALUES (?, ?)",
-                        (request.form["user_id"], role),
+                        "DELETE FROM user_roles WHERE user_id = ?", (user["id"],)
                     )
-            return redirect(url_for("members"))
+                    roles = request.form.getlist(f"roles_{user['id']}")
+                    for role in normalized_roles(roles):
+                        conn.execute(
+                            "INSERT INTO user_roles(user_id, role) VALUES (?, ?)",
+                            (user["id"], role),
+                        )
+                flash("Rollen wurden aktualisiert.")
+            elif action in {"reset-password", "show-initial"}:
+                target = member_password_target(conn, int(request.form["user_id"]))
+                if not target:
+                    abort(403)
+                if action == "reset-password":
+                    password = reset_initial_password(conn, target["id"])
+                elif (
+                    target["initial_data_acknowledged"]
+                    or not target["initial_password_encrypted"]
+                ):
+                    abort(404)
+                else:
+                    password = reveal_initial_password(target)
+                credentials = credential_details(conn, target["id"], password)
+                session["pending_initial_user_id"] = target["id"]
+            if credentials is None:
+                return redirect(url_for("members"))
         users = get_users(conn)
         role_map = roles_for_users(conn)
+        pending_id = session.get("pending_initial_user_id")
+        if credentials is None and pending_id:
+            pending = member_password_target(conn, int(pending_id))
+            if pending and pending["initial_password_encrypted"]:
+                credentials = credential_details(
+                    conn, pending["id"], reveal_initial_password(pending)
+                )
     return render_template(
-        "members.html", users=users, role_map=role_map, roles=ROLE_ORDER
+        "members.html",
+        users=users,
+        role_map=role_map,
+        roles=ROLE_ORDER,
+        credentials=credentials,
     )
+
+
+def member_password_target(conn, user_id: int) -> sqlite3.Row | None:
+    target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not target:
+        return None
+    if current_user.has_role("admin"):
+        return target
+    roles = roles_for_users(conn).get(user_id, [])
+    return target if current_user.has_role("ausbilder") and "azubi" in roles else None
+
+
+def reset_initial_password(conn, user_id: int) -> str:
+    password = initial_password()
+    encrypted = credential_cipher().encrypt(password.encode()).decode()
+    conn.execute(
+        """UPDATE users SET password_hash = ?, must_change_password = 1,
+           initial_password_encrypted = ?, initial_data_acknowledged = 0 WHERE id = ?""",
+        (generate_password_hash(password), encrypted, user_id),
+    )
+    return password
+
+
+def credential_details(conn, user_id: int, password: str) -> dict[str, str | int]:
+    row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    return {
+        "user_id": user_id,
+        "username": row["username"],
+        "password": password,
+        "link": initial_link(row["username"], password),
+    }
+
+
+@app.post("/members/acknowledge-initial-data")
+@login_required
+def acknowledge_initial_data():
+    if not (current_user.has_role("admin") or current_user.has_role("ausbilder")):
+        abort(403)
+    user_id = int((request.get_json(silent=True) or {}).get("user_id", 0))
+    with db() as conn:
+        if not member_password_target(conn, user_id):
+            abort(403)
+        conn.execute(
+            "UPDATE users SET initial_data_acknowledged = 1 WHERE id = ?", (user_id,)
+        )
+    if session.get("pending_initial_user_id") == user_id:
+        session.pop("pending_initial_user_id")
+    return jsonify({"ok": True})
 
 
 @app.route("/years")
@@ -781,7 +1050,7 @@ def import_excel(path: Path) -> None:
             user_id = (
                 user["id"]
                 if user
-                else create_user(conn, username, first, last, "changeme", ["normal"])
+                else create_initial_user(conn, username, first, last, ["normal"])[0]
             )
             for cell in row[1:]:
                 entry_date = date_columns.get(cell.column)
@@ -809,6 +1078,20 @@ def inject_globals():
 @app.before_request
 def ensure_database():
     init_db()
+    if (
+        current_user.is_authenticated
+        and session.get("pending_initial_user_id")
+        and request.endpoint
+        not in {"members", "acknowledge_initial_data", "logout", "static"}
+    ):
+        return redirect(url_for("members"))
+    allowed = {"initial_login", "logout", "static"}
+    if (
+        current_user.is_authenticated
+        and current_user.must_change_password
+        and request.endpoint not in allowed
+    ):
+        return redirect(url_for("initial_login"))
 
 
 if __name__ == "__main__":
