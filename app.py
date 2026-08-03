@@ -4,7 +4,10 @@ import os
 import base64
 import hashlib
 import secrets
+import re
+import shutil
 import sqlite3
+import subprocess
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -35,6 +38,7 @@ from flask_login import (
 )
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
+from docx import Document
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -116,6 +120,23 @@ ALLOWED_BY_ROLE = {
     "admin": set(ENTRY_TYPES),
 }
 GERMAN_WEEKDAYS = ["Mo", "Di", "Mi", "Do", "Fr"]
+DESKSHARING_STATUSES = {
+    "Anwesend": "72C472",
+    "Homeoffice": "74A9E6",
+    "Abwesend": "D9D9D9",
+}
+DESKSHARING_WEEKDAYS = {
+    "mo": 1,
+    "montag": 1,
+    "di": 2,
+    "dienstag": 2,
+    "mi": 3,
+    "mittwoch": 3,
+    "do": 4,
+    "donnerstag": 4,
+    "fr": 5,
+    "freitag": 5,
+}
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-change-me")
@@ -175,6 +196,15 @@ def init_db() -> None:
                 code TEXT NOT NULL,
                 created_by INTEGER,
                 UNIQUE(user_id, entry_date, code),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS desksharing_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                entry_date TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_by INTEGER,
+                UNIQUE(user_id, entry_date),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             """
@@ -517,6 +547,18 @@ def profile():
             "SELECT * FROM users WHERE id = ?", (current_user.id,)
         ).fetchone()
         if request.method == "POST":
+            if request.form.get("action") == "delete-profile-image":
+                if row["profile_image"]:
+                    image_path = (
+                        Path(app.config["PROFILE_UPLOAD_FOLDER"]) / row["profile_image"]
+                    )
+                    image_path.unlink(missing_ok=True)
+                    conn.execute(
+                        "UPDATE users SET profile_image = NULL WHERE id = ?",
+                        (current_user.id,),
+                    )
+                flash("Profilbild gelöscht.")
+                return redirect(url_for("profile"))
             email = (row["email"] or request.form.get("email", "")).strip()
             if not email:
                 flash("Die E-Mail-Adresse ist eine Pflichtangabe.")
@@ -822,6 +864,63 @@ def years():
     return render_template("years.html", years=years_list)
 
 
+@app.route("/desksharing")
+@login_required
+def desksharing():
+    year = int(request.args.get("year", date.today().year))
+    days = weekdays_between(date(year, 1, 1), date(year, 12, 31))
+    with db() as conn:
+        users = get_users(conn)
+        rows = conn.execute(
+            "SELECT * FROM desksharing_entries WHERE entry_date BETWEEN ? AND ?",
+            (days[0].isoformat(), days[-1].isoformat()),
+        ).fetchall()
+    entries = {(row["user_id"], row["entry_date"]): row["status"] for row in rows}
+    return render_template(
+        "desksharing.html",
+        year=year,
+        days=days,
+        users=users,
+        entries=entries,
+        statuses=DESKSHARING_STATUSES,
+        month_spans=month_spans(days),
+        year_spans=year_spans(days),
+        today_monday=current_week_monday().isoformat(),
+    )
+
+
+@app.post("/desksharing/bulk-entry")
+@login_required
+def desksharing_bulk_entry():
+    if not current_user.has_role("admin"):
+        abort(403)
+    payload = request.get_json(silent=True) or {}
+    cells = payload.get("cells", [])
+    status = payload.get("status")
+    delete = payload.get("delete", False)
+    if not delete and status not in DESKSHARING_STATUSES:
+        abort(400)
+    with db() as conn:
+        for cell in cells:
+            user_id = int(cell["user_id"])
+            entry_date = date.fromisoformat(cell["date"]).isoformat()
+            if delete:
+                conn.execute(
+                    "DELETE FROM desksharing_entries WHERE user_id = ? AND entry_date = ?",
+                    (user_id, entry_date),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO desksharing_entries(
+                        user_id, entry_date, status, created_by
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id, entry_date) DO UPDATE SET
+                        status = excluded.status, created_by = excluded.created_by""",
+                    (user_id, entry_date, status, current_user.id),
+                )
+    return jsonify({"updated": len(cells)})
+
+
 def fill_for(viewer: User, target_id: int, roles: list[str], code: str) -> str:
     return visible_code(viewer, target_id, roles, code)[1]
 
@@ -911,10 +1010,183 @@ def upload():
         Path(app.config["UPLOAD_FOLDER"]).mkdir(parents=True, exist_ok=True)
         path = Path(app.config["UPLOAD_FOLDER"]) / filename
         file.save(path)
-        import_excel(path)
-        flash("Excel-Datei wurde importiert.")
-        return redirect(url_for("index"))
+        suffix = path.suffix.lower()
+        if suffix == ".xlsx":
+            import_excel(path)
+            flash("Excel-Datei wurde importiert.")
+            return redirect(url_for("index"))
+        if suffix in {".doc", ".docx"}:
+            imported = import_desksharing_word(path, date.today().year)
+            flash(f"Word-Datei wurde importiert ({imported} Einträge).")
+            return redirect(url_for("desksharing"))
+        path.unlink(missing_ok=True)
+        abort(400)
     return render_template("upload.html")
+
+
+def extract_word_rows(path: Path) -> list[list[str]]:
+    if path.suffix.lower() == ".docx" or path.read_bytes()[:2] == b"PK":
+        document = Document(path)
+        rows = []
+        for block in document.iter_inner_content():
+            if hasattr(block, "rows"):
+                rows.extend(
+                    [cell.text.strip() for cell in table_row.cells]
+                    for table_row in block.rows
+                )
+            else:
+                rows.extend([line.strip()] for line in block.text.splitlines())
+        return [row for row in rows if any(row)]
+    antiword = shutil.which("antiword")
+    if antiword:
+        result = subprocess.run(
+            [antiword, str(path)], capture_output=True, check=False, text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return [
+                line.split("\t") for line in result.stdout.splitlines() if line.strip()
+            ]
+    raw = path.read_bytes()
+    decoded = raw.decode("utf-8", errors="ignore")
+    if not decoded.strip() or decoded.count("\x00") > len(decoded) // 4:
+        decoded = raw.decode("utf-16le", errors="ignore")
+    lines = []
+    for line in decoded.replace("\x00", "").splitlines():
+        cleaned = "".join(character for character in line if character.isprintable())
+        if cleaned.strip():
+            lines.append(cleaned.split("\t"))
+    return lines
+
+
+def desksharing_user_map(conn) -> dict[str, int | None]:
+    grouped = defaultdict(list)
+    for user in get_users(conn):
+        grouped[user["first_name"].strip().casefold()].append(user["id"])
+    return {
+        first_name: user_ids[0] if len(user_ids) == 1 else None
+        for first_name, user_ids in grouped.items()
+    }
+
+
+def desksharing_date(year: int, week: int, weekday: int) -> date | None:
+    try:
+        return date.fromisocalendar(year, week, weekday)
+    except ValueError:
+        return None
+
+
+def import_desksharing_word(path: Path, year: int | None = None) -> int:
+    rows = extract_word_rows(path)
+    import_year = year or date.today().year
+    current_week = None
+    current_day = None
+    current_status = None
+    matrix_days: list[int | None] = []
+    imported = 0
+    with db() as conn:
+        users = desksharing_user_map(conn)
+
+        def save(first_name: str, weekday: int, status: str) -> None:
+            nonlocal imported
+            normalized_name = (
+                re.sub(r"\s*\([^)]*\)\s*$", "", first_name).strip().casefold()
+            )
+            user_id = users.get(normalized_name)
+            entry_date = (
+                desksharing_date(import_year, current_week, weekday)
+                if current_week
+                else None
+            )
+            if not user_id or not entry_date:
+                return
+            conn.execute(
+                """INSERT INTO desksharing_entries(
+                    user_id, entry_date, status, created_by
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, entry_date) DO UPDATE SET
+                    status = excluded.status, created_by = excluded.created_by""",
+                (
+                    user_id,
+                    entry_date.isoformat(),
+                    status,
+                    getattr(current_user, "id", None),
+                ),
+            )
+            imported += 1
+
+        for row in rows:
+            raw_cells = [cell.strip() if cell else "" for cell in row]
+            cells = [cell for cell in raw_cells if cell]
+            if not cells:
+                continue
+            joined = " ".join(cells)
+            week_match = re.search(
+                r"\b(?:KW|Kalenderwoche)\s*0?(\d{1,2})\b", joined, re.I
+            )
+            if week_match:
+                current_week = int(week_match.group(1))
+                current_day = None
+                current_status = None
+                if len(cells) == 1:
+                    continue
+            header_days = [
+                DESKSHARING_WEEKDAYS.get(cell.strip(" .:").casefold())
+                for cell in raw_cells[1:]
+            ]
+            if header_days and sum(day is not None for day in header_days) >= 2:
+                matrix_days = header_days
+                continue
+            first_name_key = raw_cells[0].casefold()
+            if matrix_days and users.get(first_name_key):
+                for weekday, value in zip(matrix_days, raw_cells[1:], strict=False):
+                    status = next(
+                        (
+                            name
+                            for name in DESKSHARING_STATUSES
+                            if name.casefold() == value.casefold()
+                        ),
+                        None,
+                    )
+                    if weekday and status:
+                        save(raw_cells[0], weekday, status)
+                continue
+            for cell in cells:
+                day = next(
+                    (
+                        weekday
+                        for label, weekday in DESKSHARING_WEEKDAYS.items()
+                        if re.search(rf"\b{re.escape(label)}\b", cell, re.I)
+                    ),
+                    None,
+                )
+                if day:
+                    current_day = day
+                status = next(
+                    (
+                        name
+                        for name in DESKSHARING_STATUSES
+                        if re.search(rf"\b{name}\b", cell, re.I)
+                    ),
+                    None,
+                )
+                if status:
+                    current_status = status
+                remainder = re.sub(
+                    r"\b(?:KW|Kalenderwoche)\s*\d{1,2}\b", "", cell, flags=re.I
+                )
+                for label in DESKSHARING_WEEKDAYS:
+                    remainder = re.sub(
+                        rf"\b{re.escape(label)}\b", "", remainder, flags=re.I
+                    )
+                for name in DESKSHARING_STATUSES:
+                    remainder = re.sub(rf"\b{name}\b", "", remainder, flags=re.I)
+                if current_week and current_day and current_status:
+                    for candidate in re.split(
+                        r"[,;/]|\s+und\s+", remainder.strip(" :-"), flags=re.I
+                    ):
+                        if candidate.strip().casefold() in users:
+                            save(candidate, current_day, current_status)
+    return imported
 
 
 def excel_fill_key(cell) -> tuple | None:

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import load_workbook
+from docx import Document
 
 import app as vacation_app
 
@@ -323,6 +324,14 @@ def test_profile_picture_appears_in_navbar_and_matrix_but_not_export(client):
     workbook = load_workbook(BytesIO(workbook_response.data))
     assert workbook.active._images == []
 
+    deleted = client.post(
+        "/profile",
+        data={"action": "delete-profile-image"},
+        follow_redirects=True,
+    )
+    assert b"Profilbild gel" in deleted.data
+    assert b"/profile-image/user-1.png" not in client.get("/").data
+
 
 def test_mobile_delete_control_and_responsive_matrix_are_rendered(client):
     login(client)
@@ -333,6 +342,78 @@ def test_mobile_delete_control_and_responsive_matrix_are_rendered(client):
     assert b"width:calc(100% - 2rem)" in stylesheet
     assert b"scroll-snap-type:x mandatory" in stylesheet
     assert b"border-right:4px solid #111" in stylesheet
+
+
+def test_desksharing_docx_import_uses_iso_week_and_first_names(client, tmp_path):
+    login(client)
+    with vacation_app.db() as conn:
+        anna_id = vacation_app.create_user(
+            conn, "anna", "Anna", "Muster", "password", ["normal"]
+        )
+        ben_id = vacation_app.create_user(
+            conn, "ben", "Ben", "Beispiel", "password", ["normal"]
+        )
+    document = Document()
+    document.add_paragraph("KW 32")
+    table = document.add_table(rows=3, cols=4)
+    for column, value in enumerate(["Name", "Montag", "Dienstag", "Mittwoch"]):
+        table.cell(0, column).text = value
+    for column, value in enumerate(["Anna", "Anwesend", "Homeoffice", "Abwesend"]):
+        table.cell(1, column).text = value
+    for column, value in enumerate(["Ben", "Homeoffice", "Anwesend", ""]):
+        table.cell(2, column).text = value
+    path = tmp_path / "Desksharing-Detaillierung.docx"
+    document.save(path)
+
+    assert vacation_app.import_desksharing_word(path, 2026) == 5
+    monday = date.fromisocalendar(2026, 32, 1).isoformat()
+    tuesday = date.fromisocalendar(2026, 32, 2).isoformat()
+    with vacation_app.db() as conn:
+        assert (
+            conn.execute(
+                "SELECT status FROM desksharing_entries WHERE user_id = ? AND entry_date = ?",
+                (anna_id, monday),
+            ).fetchone()["status"]
+            == "Anwesend"
+        )
+        assert (
+            conn.execute(
+                "SELECT status FROM desksharing_entries WHERE user_id = ? AND entry_date = ?",
+                (ben_id, tuesday),
+            ).fetchone()["status"]
+            == "Anwesend"
+        )
+
+
+def test_legacy_word_text_import_and_admin_desksharing_edit(client, tmp_path):
+    login(client)
+    with vacation_app.db() as conn:
+        user_id = vacation_app.create_user(
+            conn, "lea", "Lea", "Muster", "password", ["normal"]
+        )
+    path = tmp_path / "Desksharing-Detaillierung.doc"
+    path.write_text("KW 33\nMontag\nHomeoffice: Lea\n", encoding="utf-8")
+    assert vacation_app.import_desksharing_word(path, 2026) == 1
+    monday = date.fromisocalendar(2026, 33, 1).isoformat()
+    response = client.post(
+        "/desksharing/bulk-entry",
+        json={
+            "status": "Anwesend",
+            "cells": [{"user_id": user_id, "date": monday}],
+        },
+    )
+    assert response.json == {"updated": 1}
+    planner = client.get("/desksharing?year=2026")
+    assert b"Desksharing 2026" in planner.data
+    assert b"Anwesend" in planner.data
+
+    client.get("/logout")
+    login(client, "lea", "password")
+    forbidden = client.post(
+        "/desksharing/bulk-entry",
+        json={"delete": True, "cells": [{"user_id": user_id, "date": monday}]},
+    )
+    assert forbidden.status_code == 403
 
 
 def test_repo_example_excel_imports_entries(client):

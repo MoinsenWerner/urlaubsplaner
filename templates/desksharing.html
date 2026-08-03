@@ -1,0 +1,22 @@
+{% extends 'base.html' %}{% block body %}
+<header class="toolbar"><h1>Desksharing {{ year }}</h1><button id="today" data-date="{{ today_monday }}">Heute</button></header>
+<section class="legend" aria-label="Desksharing-Legende">
+  {% for status, color in statuses.items() %}<button class="legend-item" data-status="{{ status }}" style="--legend-color:#{{ color }}" {% if not current_user.has_role('admin') %}disabled{% endif %}><span></span>{{ status }}</button>{% endfor %}
+  {% if current_user.has_role('admin') %}<button class="legend-item delete-hint" id="delete-desksharing" type="button">ENTF – Auswahl löschen</button>{% endif %}
+</section>
+<div class="planner" id="desksharing-planner"><table class="matrix"><thead>
+<tr><th class="name header-spacer" rowspan="4">Name</th>{% for span in year_spans %}<th class="period year" colspan="{{ span.span }}">{{ span.label }}</th>{% endfor %}</tr>
+<tr>{% for span in month_spans %}<th class="period month" colspan="{{ span.span }}">{{ span.label }}</th>{% endfor %}</tr>
+<tr>{% for day in days %}<th id="desk-{{ day.isoformat() }}" class="day weekday{% if day.weekday() == 4 %} week-end{% endif %}">{% if day.weekday() == 0 %}Mo{% endif %}</th>{% endfor %}</tr>
+<tr>{% for day in days %}<th class="day day-number{% if day.weekday() == 4 %} week-end{% endif %}">{{ day.day }}</th>{% endfor %}</tr>
+</thead><tbody>{% for user in users %}<tr><th class="name"><span class="matrix-user">{% if user.profile_image %}<img class="avatar avatar-matrix" src="{{ url_for('profile_image', filename=user.profile_image) }}" alt="">{% endif %}<span>{{ user.first_name }} {{ user.last_name }}</span></span></th>{% for day in days %}{% set status = entries.get((user.id, day.isoformat())) %}<td class="band-cell desk-cell{% if day.weekday() == 4 %} week-end{% endif %}{% if current_user.has_role('admin') %} editable{% endif %}" data-user-id="{{ user.id }}" data-date="{{ day.isoformat() }}" data-tooltip="{% if status %}{{ day.strftime('%d.%m.%Y') }} – {{ status }}{% endif %}" style="{% if status %}background:#{{ statuses[status] }}{% endif %}"></td>{% endfor %}</tr>{% endfor %}</tbody></table></div>
+{% if current_user.has_role('admin') %}<script>
+const planner=document.getElementById('desksharing-planner');const selected=new Set();
+function key(cell){return `${cell.dataset.userId}|${cell.dataset.date}`}
+function repaint(){document.querySelectorAll('.desk-cell.selected').forEach(cell=>cell.classList.remove('selected'));selected.forEach(value=>{const [user,date]=value.split('|');document.querySelector(`.desk-cell[data-user-id="${user}"][data-date="${date}"]`)?.classList.add('selected')})}
+document.querySelectorAll('.desk-cell.editable').forEach(cell=>cell.addEventListener('click',event=>{const value=key(cell);const touch=matchMedia('(pointer: coarse)').matches;if(!touch&&!event.ctrlKey&&!event.metaKey&&!event.shiftKey)selected.clear();selected.has(value)?selected.delete(value):selected.add(value);repaint()}));
+async function update(payload){if(!selected.size)return;payload.cells=[...selected].map(value=>{const [user_id,date]=value.split('|');return {user_id,date}});const response=await fetch('{{ url_for("desksharing_bulk_entry") }}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(response.ok)location.reload()}
+document.querySelectorAll('[data-status]').forEach(button=>button.addEventListener('click',()=>update({status:button.dataset.status})));
+const remove=()=>update({delete:true});document.getElementById('delete-desksharing').addEventListener('click',remove);document.addEventListener('keydown',event=>{if((event.key==='Delete'||event.key==='Backspace')&&selected.size){event.preventDefault();remove()}});
+document.getElementById('today').onclick=()=>{const target=document.getElementById(`desk-${document.getElementById('today').dataset.date}`);if(target)planner.scrollLeft=target.offsetLeft-document.querySelector('.matrix th.name').offsetWidth};planner.addEventListener('wheel',event=>{event.preventDefault();planner.scrollLeft+=event.deltaY},{passive:false});window.onload=()=>document.getElementById('today').click();
+</script>{% endif %}{% endblock %}

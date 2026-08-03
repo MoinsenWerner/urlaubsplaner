@@ -1,7 +1,7 @@
 {% extends 'base.html' %}{% block body %}
 <main class="page profile-page"><h1>Profil</h1>
   <form method="post" enctype="multipart/form-data" class="card profile-form">
-    {% if profile.profile_image %}<img class="profile-image" src="{{ url_for('profile_image', filename=profile.profile_image) }}" alt="Profilbild">{% endif %}
+    {% if profile.profile_image %}<img class="profile-image" src="{{ url_for('profile_image', filename=profile.profile_image) }}" alt="Profilbild"><button class="danger" type="submit" name="action" value="delete-profile-image" formnovalidate>Profilbild löschen</button>{% endif %}
     <label>Profilbild <input type="file" name="profile_image" accept="image/jpeg,image/png,image/webp,image/gif"></label>
     <label>Geburtsdatum <input type="date" name="birth_date" value="{{ profile.birth_date or '' }}"></label>
     <label>E-Mail-Adresse <input type="email" name="email" value="{{ profile.email or '' }}" {% if profile.email %}readonly{% else %}required{% endif %}></label>
