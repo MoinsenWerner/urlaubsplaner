@@ -1,7 +1,9 @@
 from datetime import date
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 import app as vacation_app
 
@@ -9,7 +11,11 @@ import app as vacation_app
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(vacation_app, "DB_PATH", tmp_path / "test.sqlite3")
-    vacation_app.app.config.update(TESTING=True, SECRET_KEY="test")
+    vacation_app.app.config.update(
+        TESTING=True,
+        SECRET_KEY="test",
+        PROFILE_UPLOAD_FOLDER=str(tmp_path / "profile-images"),
+    )
     vacation_app.init_db()
     return vacation_app.app.test_client()
 
@@ -290,6 +296,43 @@ def test_profile_email_is_required_and_immutable(client):
         ).fetchone()
     assert row["email"] == "admin@example.de"
     assert row["birth_date"] is None
+
+
+def test_profile_picture_appears_in_navbar_and_matrix_but_not_export(client):
+    login(client)
+    response = client.post(
+        "/profile",
+        data={
+            "email": "admin@example.de",
+            "birth_date": "",
+            "profile_image": (BytesIO(b"test-image"), "portrait.png"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    planner = client.get("/")
+    assert planner.data.count(b"/profile-image/user-1.png") == 2
+    assert b"avatar-nav" in planner.data
+    assert b"avatar-matrix" in planner.data
+
+    workbook_response = client.post(
+        "/download",
+        data={"start_year": date.today().year, "end_year": date.today().year},
+    )
+    workbook = load_workbook(BytesIO(workbook_response.data))
+    assert workbook.active._images == []
+
+
+def test_mobile_delete_control_and_responsive_matrix_are_rendered(client):
+    login(client)
+    planner = client.get("/")
+    assert b'id="delete-selection"' in planner.data
+    assert b"addEventListener('click',deleteSelection)" in planner.data
+    stylesheet = client.get("/static/style.css").data
+    assert b"width:calc(100% - 2rem)" in stylesheet
+    assert b"scroll-snap-type:x mandatory" in stylesheet
+    assert b"border-right:4px solid #111" in stylesheet
 
 
 def test_repo_example_excel_imports_entries(client):

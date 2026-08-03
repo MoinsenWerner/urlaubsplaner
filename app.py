@@ -133,6 +133,7 @@ class User(UserMixin):
         self.username = row["username"]
         self.password_hash = row["password_hash"]
         self.must_change_password = bool(row["must_change_password"])
+        self.profile_image = row["profile_image"]
         self.roles = roles
 
     def has_role(self, role: str) -> bool:
