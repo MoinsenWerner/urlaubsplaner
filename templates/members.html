@@ -1,0 +1,67 @@
+{% extends 'base.html' %}{% block body %}
+<main class="page">
+  <h1>Mitglieder verwalten</h1>
+  {% if current_user.has_role('admin') %}
+  <section class="card">
+    <h2>Neuen Nutzer erstellen</h2>
+    <form method="post" class="grid create-user-form">
+      <input type="hidden" name="action" value="create">
+      <input name="username" placeholder="Benutzername" required>
+      <input name="first_name" placeholder="Vorname" required>
+      <input name="last_name" placeholder="Nachname" required>
+      {% for role in roles %}<label><input type="checkbox" name="roles" value="{{ role }}"> {{ role }}</label>{% endfor %}
+      <button>Erstellen</button>
+    </form>
+  </section>
+  {% endif %}
+
+  <form method="post">
+    <input type="hidden" name="action" value="roles-bulk">
+    <table class="members-table">
+      <thead><tr><th>Name</th><th>Benutzername</th><th>Rollen</th><th>Aktionen</th></tr></thead>
+      <tbody>{% for user in users %}<tr>
+        <td>{{ user.last_name }}, {{ user.first_name }}</td>
+        <td>{{ user.username }}</td>
+        <td>{% for role in roles %}<label><input type="checkbox" name="roles_{{ user.id }}" value="{{ role }}" {% if role in role_map[user.id] %}checked{% endif %} {% if not current_user.has_role('admin') %}disabled{% endif %}> {{ role }}</label>{% endfor %}</td>
+        <td class="member-actions">
+          {% if current_user.has_role('admin') or (current_user.has_role('ausbilder') and 'azubi' in role_map[user.id]) %}
+          <button form="reset-{{ user.id }}">Passwort vergessen</button>
+          {% if not user.initial_data_acknowledged and user.initial_password_encrypted %}<button form="initial-{{ user.id }}">Initialdaten bekommen</button>{% endif %}
+          {% endif %}
+          {% if current_user.has_role('admin') %}<button class="danger" form="delete-{{ user.id }}">Löschen</button>{% endif %}
+        </td>
+      </tr>{% endfor %}</tbody>
+    </table>
+    {% if current_user.has_role('admin') %}<button class="primary roles-update">Rollen updaten</button>{% endif %}
+  </form>
+  {% for user in users %}
+    <form id="reset-{{ user.id }}" method="post"><input type="hidden" name="action" value="reset-password"><input type="hidden" name="user_id" value="{{ user.id }}"></form>
+    <form id="initial-{{ user.id }}" method="post"><input type="hidden" name="action" value="show-initial"><input type="hidden" name="user_id" value="{{ user.id }}"></form>
+    <form id="delete-{{ user.id }}" method="post" onsubmit="return confirm('Nutzer wirklich löschen?')"><input type="hidden" name="action" value="delete"><input type="hidden" name="user_id" value="{{ user.id }}"></form>
+  {% endfor %}
+</main>
+{% if credentials %}
+<div class="credential-backdrop" id="credential-dialog" role="dialog" aria-modal="true" aria-labelledby="credential-title">
+  <section class="credential-dialog">
+    <h2 id="credential-title">Neu erstellte Initialdatenanzeige</h2>
+    <p>Speichere diese Daten jetzt. Das Initialpasswort wird danach nicht erneut angezeigt.</p>
+    <dl><dt>Benutzername</dt><dd>{{ credentials.username }}</dd><dt>Initialpasswort</dt><dd>{{ credentials.password }}</dd></dl>
+    <p id="copy-status" aria-live="polite"></p>
+    <button type="button" data-copy="credentials">Anmeldedaten kopieren</button>
+    <button type="button" data-copy="link">Initial-Link kopieren</button>
+  </section>
+</div>
+<script>
+const credentialData={userId:{{ credentials.user_id|tojson }},username:{{ credentials.username|tojson }},password:{{ credentials.password|tojson }},link:{{ credentials.link|tojson }}};
+document.querySelectorAll('[data-copy]').forEach(button=>button.addEventListener('click',async()=>{
+  const text=button.dataset.copy==='link'?credentialData.link:`Link: https://urlaub.extrahelden.de/initial-login\nBenutzername: ${credentialData.username}\nInitialpasswort: ${credentialData.password}\nBitte ändere dein Passwort so schnell wie möglich.`;
+  try {
+    await navigator.clipboard.writeText(text);
+    const response=await fetch('{{ url_for("acknowledge_initial_data") }}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:credentialData.userId})});
+    if(!response.ok) throw new Error();
+    document.getElementById('credential-dialog').remove();
+  } catch(error) { document.getElementById('copy-status').textContent='Kopieren fehlgeschlagen. Bitte erlaube den Zugriff auf die Zwischenablage.'; }
+}));
+</script>
+{% endif %}
+{% endblock %}
