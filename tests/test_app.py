@@ -421,6 +421,61 @@ def test_legacy_word_text_import_and_admin_desksharing_edit(client, tmp_path):
     assert forbidden.status_code == 403
 
 
+def test_admin_can_persist_independent_matrix_orders(client):
+    login(client)
+    with vacation_app.db() as conn:
+        first_id = vacation_app.create_user(
+            conn, "first", "Erster", "Nutzer", "password", ["normal", "desksharing"]
+        )
+        second_id = vacation_app.create_user(
+            conn,
+            "second",
+            "Zweiter",
+            "Nutzer",
+            "password",
+            ["normal", "desksharing"],
+        )
+    vacation_order = [second_id, first_id, 1]
+    saved = client.post("/matrix-order/vacation", json={"user_ids": vacation_order})
+    assert saved.json == {"saved": 3}
+    vacation_page = client.get("/").data
+    vacation_rows = [
+        vacation_page.index(f'<tr data-user-id="{user_id}"'.encode())
+        for user_id in vacation_order
+    ]
+    assert vacation_rows == sorted(vacation_rows)
+
+    desksharing_order = [first_id, second_id]
+    saved = client.post(
+        "/matrix-order/desksharing", json={"user_ids": desksharing_order}
+    )
+    assert saved.json == {"saved": 2}
+    desksharing_page = client.get("/desksharing").data
+    assert desksharing_page.index(b"Erster Nutzer") < desksharing_page.index(
+        b"Zweiter Nutzer"
+    )
+    assert b"Sortiermodus starten" in desksharing_page
+    assert b"Anordnung speichern" in desksharing_page
+    assert b"matrix-order.js" in desksharing_page
+
+    client.get("/logout")
+    login(client, "first", "password")
+    assert (
+        client.post(
+            "/matrix-order/desksharing", json={"user_ids": desksharing_order}
+        ).status_code
+        == 403
+    )
+
+
+def test_matrix_order_rejects_incomplete_user_lists(client):
+    login(client)
+    assert (
+        client.post("/matrix-order/vacation", json={"user_ids": [1, 1]}).status_code
+        == 400
+    )
+
+
 def test_repo_example_excel_imports_entries(client):
     login(client)
     example = (

@@ -1,5 +1,5 @@
 {% extends 'base.html' %}{% block body %}
-<header class="toolbar"><h1>Urlaubsübersicht {{ year }}</h1><button id="today" data-date="{{ today_monday }}">Heute</button></header>
+<header class="toolbar"><h1>Urlaubsübersicht {{ year }}</h1><button id="today" data-date="{{ today_monday }}">Heute</button>{% if current_user.has_role('admin') %}<button class="mobile-sort-start" type="button">Sortiermodus starten</button><button class="mobile-sort-save" type="button" hidden>Anordnung speichern</button>{% endif %}</header>
 <section class="legend" aria-label="Legende">
   {% for code, item in entry_types.items() %}
     {% if current_user.has_role('admin') or code in allowed_codes %}
@@ -8,14 +8,14 @@
   {% endfor %}
   <button class="legend-item delete-hint" id="delete-selection" type="button">ENTF – Auswahl löschen</button>
 </section>
-<div class="planner" id="planner"><table class="matrix"><thead>
+<div class="planner" id="planner"{% if current_user.has_role('admin') %} data-order-matrix data-order-url="{{ url_for('save_matrix_order', matrix_name='vacation') }}"{% endif %}><table class="matrix"><thead>
 <tr><th class="name header-spacer" rowspan="4">Name</th>{% for span in year_spans %}<th class="period year" colspan="{{ span.span }}">{{ span.label }}</th>{% endfor %}</tr>
 <tr>{% for span in month_spans %}<th class="period month" colspan="{{ span.span }}">{{ span.label }}</th>{% endfor %}</tr>
 <tr>{% for day in days %}<th id="d{{ day.isoformat() }}" class="day weekday{% if day.weekday() == 4 %} week-end{% endif %}{% if day.isoformat() in holidays %} holiday-col{% endif %}" style="{% if day.isoformat() in holidays %}background:#{{ holiday_color }}{% endif %}">{% if day.weekday() == 0 %}Mo{% endif %}</th>{% endfor %}</tr>
 <tr>{% for day in days %}<th class="day day-number{% if day.weekday() == 4 %} week-end{% endif %}{% if day.isoformat() in holidays %} holiday-col{% endif %}" style="{% if day.isoformat() in holidays %}background:#{{ holiday_color }}{% endif %}">{{ day.day }}</th>{% endfor %}</tr>
-</thead><tbody>
+</thead><tbody class="user-order-body">
 <tr><th class="name">Ferien</th>{% for day in days %}<td class="band-cell readonly{% if day.weekday() == 4 %} week-end{% endif %}" style="{% if day.isoformat() in vacations %}background:#{{ vacation_color }}{% elif day.isoformat() in holidays %}background:#{{ holiday_color }}{% endif %}" data-tooltip="{{ vacations.get(day.isoformat(), holidays.get(day.isoformat(), '')) }}"></td>{% endfor %}</tr>
-{% for user in users %}<tr><th class="name"><span class="matrix-user">{% if user.profile_image %}<img class="avatar avatar-matrix" src="{{ url_for('profile_image', filename=user.profile_image) }}" alt="">{% endif %}<span>{{ user.first_name }} {{ user.last_name }}<small>{{ ', '.join(role_map[user.id]) }}</small></span></span></th>{% for day in days %}{% set codes = entries.get((user.id, day.isoformat()), []) %}{% set cell = cell_style_and_tooltip(current_user, user.id, role_map[user.id], day, codes) %}<td class="band-cell{% if day.weekday() == 4 %} week-end{% endif %}{% if current_user.has_role('admin') or current_user.id|int == user.id %} editable{% endif %}" data-user-id="{{ user.id }}" data-date="{{ day.isoformat() }}" data-tooltip="{{ cell[1] }}" style="{% if cell[0] %}background:#{{ cell[0] }}{% elif day.isoformat() in holidays %}background:#{{ holiday_color }}{% endif %}"></td>{% endfor %}</tr>{% endfor %}
+{% for user in users %}<tr data-user-id="{{ user.id }}"><th class="name{% if current_user.has_role('admin') %} reorder-handle{% endif %}"{% if current_user.has_role('admin') %} draggable="true" title="Zum Umsortieren ziehen"{% endif %}><span class="matrix-user">{% if user.profile_image %}<img class="avatar avatar-matrix" src="{{ url_for('profile_image', filename=user.profile_image) }}" alt="">{% endif %}<span>{{ user.first_name }} {{ user.last_name }}<small>{{ ', '.join(role_map[user.id]) }}</small></span></span></th>{% for day in days %}{% set codes = entries.get((user.id, day.isoformat()), []) %}{% set cell = cell_style_and_tooltip(current_user, user.id, role_map[user.id], day, codes) %}<td class="band-cell{% if day.weekday() == 4 %} week-end{% endif %}{% if current_user.has_role('admin') or current_user.id|int == user.id %} editable{% endif %}" data-user-id="{{ user.id }}" data-date="{{ day.isoformat() }}" data-tooltip="{{ cell[1] }}" style="{% if cell[0] %}background:#{{ cell[0] }}{% elif day.isoformat() in holidays %}background:#{{ holiday_color }}{% endif %}"></td>{% endfor %}</tr>{% endfor %}
 </tbody></table></div>
 <script>
 const planner=document.getElementById('planner');
@@ -31,4 +31,4 @@ document.addEventListener('keydown',ev=>{if(ev.key==='Delete'||ev.key==='Backspa
 document.getElementById('today').onclick=()=>{const target=document.getElementById('d'+document.getElementById('today').dataset.date);if(target){planner.scrollLeft=target.offsetLeft-document.querySelector('.matrix th.name').offsetWidth;}};
 planner.addEventListener('wheel',ev=>{ev.preventDefault();planner.scrollLeft+=ev.deltaY;},{passive:false});
 window.onload=()=>document.getElementById('today').click();
-</script>{% endblock %}
+</script>{% if current_user.has_role('admin') %}<script src="{{ url_for('static', filename='matrix-order.js') }}"></script>{% endif %}{% endblock %}

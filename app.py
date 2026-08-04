@@ -208,6 +208,13 @@ def init_db() -> None:
                 UNIQUE(user_id, entry_date),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS user_matrix_order (
+                matrix_name TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (matrix_name, user_id),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
@@ -362,6 +369,27 @@ def get_desksharing_users(conn) -> list[sqlite3.Row]:
         )
     }
     return [user for user in get_users(conn) if user["id"] in desksharing_ids]
+
+
+def order_matrix_users(
+    conn, users: list[sqlite3.Row], matrix_name: str
+) -> list[sqlite3.Row]:
+    positions = {
+        row["user_id"]: row["position"]
+        for row in conn.execute(
+            "SELECT user_id, position FROM user_matrix_order WHERE matrix_name = ?",
+            (matrix_name,),
+        )
+    }
+    fallback = len(positions) + len(users)
+    original_positions = {user["id"]: index for index, user in enumerate(users)}
+    return sorted(
+        users,
+        key=lambda user: (
+            positions.get(user["id"], fallback + original_positions[user["id"]]),
+            original_positions[user["id"]],
+        ),
+    )
 
 
 def visible_code(
@@ -643,7 +671,7 @@ def index():
     days = weekdays_between(start, end)
     today_monday = current_week_monday().isoformat()
     with db() as conn:
-        users = get_users(conn)
+        users = order_matrix_users(conn, get_users(conn), "vacation")
         role_map = roles_for_users(conn)
         entries = conn.execute(
             "SELECT * FROM entries WHERE entry_date BETWEEN ? AND ?",
@@ -881,7 +909,7 @@ def desksharing():
     year = int(request.args.get("year", date.today().year))
     days = weekdays_between(date(year, 1, 1), date(year, 12, 31))
     with db() as conn:
-        users = get_desksharing_users(conn)
+        users = order_matrix_users(conn, get_desksharing_users(conn), "desksharing")
         rows = conn.execute(
             "SELECT * FROM desksharing_entries WHERE entry_date BETWEEN ? AND ?",
             (days[0].isoformat(), days[-1].isoformat()),
@@ -898,6 +926,41 @@ def desksharing():
         year_spans=year_spans(days),
         today_monday=current_week_monday().isoformat(),
     )
+
+
+@app.post("/matrix-order/<matrix_name>")
+@login_required
+def save_matrix_order(matrix_name: str):
+    if not current_user.has_role("admin"):
+        abort(403)
+    if matrix_name not in {"vacation", "desksharing"}:
+        abort(404)
+    payload = request.get_json(silent=True) or {}
+    try:
+        user_ids = [int(user_id) for user_id in payload.get("user_ids", [])]
+    except (TypeError, ValueError):
+        abort(400)
+    if len(user_ids) != len(set(user_ids)):
+        abort(400)
+    with db() as conn:
+        visible_users = (
+            get_users(conn)
+            if matrix_name == "vacation"
+            else get_desksharing_users(conn)
+        )
+        if set(user_ids) != {user["id"] for user in visible_users}:
+            abort(400)
+        conn.execute(
+            "DELETE FROM user_matrix_order WHERE matrix_name = ?", (matrix_name,)
+        )
+        conn.executemany(
+            "INSERT INTO user_matrix_order(matrix_name, user_id, position) VALUES (?, ?, ?)",
+            [
+                (matrix_name, user_id, position)
+                for position, user_id in enumerate(user_ids)
+            ],
+        )
+    return jsonify({"saved": len(user_ids)})
 
 
 @app.post("/desksharing/bulk-entry")
