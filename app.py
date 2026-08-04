@@ -44,6 +44,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 DB_PATH = Path(os.environ.get("URLAUBSPLANER_DB", "instance/urlaubsplaner.sqlite3"))
+VBA_PROJECT_BASE64_PATH = Path(__file__).with_name("assets") / "vbaProject.bin.b64"
 ROLE_ORDER = ["admin", "ausbilder", "putzchef", "azubi", "normal", "desksharing"]
 ROLE_RANK = {role: index for index, role in enumerate(ROLE_ORDER)}
 IGNORED_IMPORT_NAMES = {
@@ -1076,7 +1077,7 @@ def download():
 
 
 def macro_enabled_workbook(xlsx_stream: BytesIO) -> BytesIO:
-    """Mark a generated OOXML workbook as macro-enabled without adding macros."""
+    """Add the bundled vacation-layout VBA project to a generated workbook."""
     xlsx_stream.seek(0)
     result = BytesIO()
     with ZipFile(xlsx_stream, "r") as source, ZipFile(
@@ -1089,9 +1090,27 @@ def macro_enabled_workbook(xlsx_stream: BytesIO) -> BytesIO:
                     b"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
                     b"application/vnd.ms-excel.sheet.macroEnabled.main+xml",
                 )
+                content = content.replace(
+                    b"</Types>",
+                    b'<Override PartName="/xl/vbaProject.bin" '
+                    b'ContentType="application/vnd.ms-office.vbaProject"/></Types>',
+                )
+            elif item.filename == "xl/_rels/workbook.xml.rels":
+                content = content.replace(
+                    b"</Relationships>",
+                    b'<Relationship Id="rIdVbaProject" '
+                    b'Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" '
+                    b'Target="vbaProject.bin"/></Relationships>',
+                )
             target.writestr(item, content)
+        target.writestr("xl/vbaProject.bin", bundled_vba_project())
     result.seek(0)
     return result
+
+
+def bundled_vba_project() -> bytes:
+    """Decode the text-only representation of the bundled VBA project."""
+    return base64.b64decode(VBA_PROJECT_BASE64_PATH.read_text(encoding="ascii"))
 
 
 @app.route("/upload", methods=["GET", "POST"])
