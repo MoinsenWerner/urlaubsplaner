@@ -383,6 +383,10 @@ def test_mobile_delete_control_and_responsive_matrix_are_rendered(client):
     planner = client.get("/")
     assert b'id="delete-selection"' in planner.data
     assert b"addEventListener('click',deleteSelection)" in planner.data
+    assert b"matrix-selection.js" in planner.data
+    selection_script = client.get("/static/matrix-selection.js").data
+    assert b"selectRectangle" in selection_script
+    assert b'cell.addEventListener("mouseenter"' in selection_script
     stylesheet = client.get("/static/style.css").data
     assert b"width:calc(100% - 2rem)" in stylesheet
     assert b"scroll-snap-type:x mandatory" in stylesheet
@@ -509,6 +513,7 @@ def test_admin_can_persist_independent_matrix_orders(client):
     assert b"Sortiermodus starten" in desksharing_page
     assert b"Anordnung speichern" in desksharing_page
     assert b"matrix-order.js" in desksharing_page
+    assert b"matrix-selection.js" in desksharing_page
 
     client.get("/logout")
     login(client, "first", "password")
