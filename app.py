@@ -8,6 +8,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+from zipfile import ZIP_DEFLATED, ZipFile
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -1063,14 +1064,34 @@ def download():
             if code == "KR" and current_user.has_role("admin")
             else color,
         )
-    stream = BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+    xlsx_stream = BytesIO()
+    wb.save(xlsx_stream)
+    stream = macro_enabled_workbook(xlsx_stream)
     return send_file(
         stream,
         as_attachment=True,
-        download_name=f"urlaubsuebersicht_{start_year}_{end_year}.xlsx",
+        download_name=f"urlaubsuebersicht_{start_year}_{end_year}.xlsm",
+        mimetype="application/vnd.ms-excel.sheet.macroEnabled.12",
     )
+
+
+def macro_enabled_workbook(xlsx_stream: BytesIO) -> BytesIO:
+    """Mark a generated OOXML workbook as macro-enabled without adding macros."""
+    xlsx_stream.seek(0)
+    result = BytesIO()
+    with ZipFile(xlsx_stream, "r") as source, ZipFile(
+        result, "w", ZIP_DEFLATED
+    ) as target:
+        for item in source.infolist():
+            content = source.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                content = content.replace(
+                    b"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                    b"application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+                )
+            target.writestr(item, content)
+    result.seek(0)
+    return result
 
 
 @app.route("/upload", methods=["GET", "POST"])
@@ -1085,7 +1106,7 @@ def upload():
         path = Path(app.config["UPLOAD_FOLDER"]) / filename
         file.save(path)
         suffix = path.suffix.lower()
-        if suffix == ".xlsx":
+        if suffix in {".xlsx", ".xlsm"}:
             import_excel(path)
             flash("Excel-Datei wurde importiert.")
             return redirect(url_for("index"))

@@ -11,12 +11,16 @@
 <tr>{% for day in days %}<th class="day day-number{% if day.weekday() == 4 %} week-end{% endif %}">{{ day.day }}</th>{% endfor %}</tr>
 </thead><tbody class="user-order-body">{% for user in users %}<tr data-user-id="{{ user.id }}"><th class="name{% if current_user.has_role('admin') %} reorder-handle{% endif %}"{% if current_user.has_role('admin') %} draggable="true" title="Zum Umsortieren ziehen"{% endif %}><span class="matrix-user">{% if user.profile_image %}<img class="avatar avatar-matrix" src="{{ url_for('profile_image', filename=user.profile_image) }}" alt="">{% endif %}<span>{{ user.first_name }} {{ user.last_name }}</span></span></th>{% for day in days %}{% set status = entries.get((user.id, day.isoformat())) %}<td class="band-cell desk-cell{% if day.weekday() == 4 %} week-end{% endif %}{% if current_user.has_role('admin') %} editable{% endif %}" data-user-id="{{ user.id }}" data-date="{{ day.isoformat() }}" data-tooltip="{% if status %}{{ day.strftime('%d.%m.%Y') }} – {{ status }}{% endif %}" style="{% if status %}background:#{{ statuses[status] }}{% endif %}"></td>{% endfor %}</tr>{% endfor %}</tbody></table></div>
 {% if current_user.has_role('admin') %}<script>
-const planner=document.getElementById('desksharing-planner');const selected=new Set();
+const selected=new Set();
 function key(cell){return `${cell.dataset.userId}|${cell.dataset.date}`}
 function repaint(){document.querySelectorAll('.desk-cell.selected').forEach(cell=>cell.classList.remove('selected'));selected.forEach(value=>{const [user,date]=value.split('|');document.querySelector(`.desk-cell[data-user-id="${user}"][data-date="${date}"]`)?.classList.add('selected')})}
 document.querySelectorAll('.desk-cell.editable').forEach(cell=>cell.addEventListener('click',event=>{const value=key(cell);const touch=matchMedia('(pointer: coarse)').matches;if(!touch&&!event.ctrlKey&&!event.metaKey&&!event.shiftKey)selected.clear();selected.has(value)?selected.delete(value):selected.add(value);repaint()}));
 async function update(payload){if(!selected.size)return;payload.cells=[...selected].map(value=>{const [user_id,date]=value.split('|');return {user_id,date}});const response=await fetch('{{ url_for("desksharing_bulk_entry") }}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(response.ok)location.reload()}
 document.querySelectorAll('[data-status]').forEach(button=>button.addEventListener('click',()=>update({status:button.dataset.status})));
 const remove=()=>update({delete:true});document.getElementById('delete-desksharing').addEventListener('click',remove);document.addEventListener('keydown',event=>{if((event.key==='Delete'||event.key==='Backspace')&&selected.size){event.preventDefault();remove()}});
-document.getElementById('today').onclick=()=>{const target=document.getElementById(`desk-${document.getElementById('today').dataset.date}`);if(target)planner.scrollLeft=target.offsetLeft-document.querySelector('.matrix th.name').offsetWidth};planner.addEventListener('wheel',event=>{event.preventDefault();planner.scrollLeft+=event.deltaY},{passive:false});window.onload=()=>document.getElementById('today').click();
-</script><script src="{{ url_for('static', filename='matrix-order.js') }}"></script>{% endif %}{% endblock %}
+</script><script src="{{ url_for('static', filename='matrix-order.js') }}"></script>{% endif %}<script>
+const desksharingPlanner=document.getElementById('desksharing-planner');
+document.getElementById('today').onclick=()=>{const target=document.getElementById(`desk-${document.getElementById('today').dataset.date}`);if(target)desksharingPlanner.scrollLeft=target.offsetLeft-document.querySelector('.matrix th.name').offsetWidth};
+desksharingPlanner.addEventListener('wheel',event=>{event.preventDefault();desksharingPlanner.scrollLeft+=event.deltaY},{passive:false});
+window.onload=()=>document.getElementById('today').click();
+</script>{% endblock %}

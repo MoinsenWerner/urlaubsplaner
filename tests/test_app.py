@@ -1,6 +1,7 @@
 from datetime import date
 from io import BytesIO
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from openpyxl import load_workbook
@@ -215,6 +216,33 @@ def test_import_ignores_excel_labels(client, tmp_path):
     assert feiertag_count == 0
 
 
+def test_admin_can_upload_macro_enabled_excel(client):
+    login(client)
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Name", date.today()])
+    sheet.append(["Mia Macro", "UrlbGnhmgt"])
+    stream = BytesIO()
+    workbook.save(stream)
+    stream.seek(0)
+    response = client.post(
+        "/upload",
+        data={"file": (stream, "historie.xlsm")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    with vacation_app.db() as conn:
+        imported = conn.execute(
+            """SELECT e.code FROM entries e JOIN users u ON u.id = e.user_id
+               WHERE u.username = ?""",
+            ("mia.macro",),
+        ).fetchone()
+    assert imported["code"] == "UG"
+
+
 def test_initial_link_and_password_reset(client):
     login(client)
     user_id, initial = create_initial_member(client, "lina", ["normal"])
@@ -323,6 +351,14 @@ def test_profile_picture_appears_in_navbar_and_matrix_but_not_export(client):
     )
     workbook = load_workbook(BytesIO(workbook_response.data))
     assert workbook.active._images == []
+    assert "urlaubsuebersicht_" in workbook_response.headers["Content-Disposition"]
+    assert ".xlsm" in workbook_response.headers["Content-Disposition"]
+    assert (
+        workbook_response.mimetype == "application/vnd.ms-excel.sheet.macroEnabled.12"
+    )
+    with ZipFile(BytesIO(workbook_response.data)) as archive:
+        content_types = archive.read("[Content_Types].xml")
+    assert b"application/vnd.ms-excel.sheet.macroEnabled.main+xml" in content_types
 
     deleted = client.post(
         "/profile",
@@ -419,6 +455,13 @@ def test_legacy_word_text_import_and_admin_desksharing_edit(client, tmp_path):
         json={"delete": True, "cells": [{"user_id": user_id, "date": monday}]},
     )
     assert forbidden.status_code == 403
+    normal_view = client.get("/desksharing?year=2026")
+    assert b'id="today"' in normal_view.data
+    assert b"const desksharingPlanner" in normal_view.data
+    assert (
+        b"window.onload=()=>document.getElementById('today').click()"
+        in normal_view.data
+    )
 
 
 def test_admin_can_persist_independent_matrix_orders(client):
