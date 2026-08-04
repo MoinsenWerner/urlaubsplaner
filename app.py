@@ -43,7 +43,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 DB_PATH = Path(os.environ.get("URLAUBSPLANER_DB", "instance/urlaubsplaner.sqlite3"))
-ROLE_ORDER = ["admin", "ausbilder", "putzchef", "azubi", "normal"]
+ROLE_ORDER = ["admin", "ausbilder", "putzchef", "azubi", "normal", "desksharing"]
 ROLE_RANK = {role: index for index, role in enumerate(ROLE_ORDER)}
 IGNORED_IMPORT_NAMES = {
     "monat",
@@ -114,6 +114,7 @@ HOLIDAY_COLOR = "ADD8E6"
 VACATION_COLOR = "BDD7EE"
 ALLOWED_BY_ROLE = {
     "normal": {"UB", "UG"},
+    "desksharing": {"UB", "UG"},
     "azubi": {"UB", "UG", "BS"},
     "putzchef": {"UB", "UG", "WP"},
     "ausbilder": {"UB", "UG", "AM", "BS", "GK", "WP"},
@@ -351,6 +352,16 @@ def roles_for_users(conn) -> dict[int, list[str]]:
     for row in conn.execute("SELECT user_id, role FROM user_roles ORDER BY user_id"):
         result[row["user_id"]].append(row["role"])
     return result
+
+
+def get_desksharing_users(conn) -> list[sqlite3.Row]:
+    desksharing_ids = {
+        row["user_id"]
+        for row in conn.execute(
+            "SELECT user_id FROM user_roles WHERE role = 'desksharing'"
+        )
+    }
+    return [user for user in get_users(conn) if user["id"] in desksharing_ids]
 
 
 def visible_code(
@@ -870,7 +881,7 @@ def desksharing():
     year = int(request.args.get("year", date.today().year))
     days = weekdays_between(date(year, 1, 1), date(year, 12, 31))
     with db() as conn:
-        users = get_users(conn)
+        users = get_desksharing_users(conn)
         rows = conn.execute(
             "SELECT * FROM desksharing_entries WHERE entry_date BETWEEN ? AND ?",
             (days[0].isoformat(), days[-1].isoformat()),
@@ -1060,7 +1071,7 @@ def extract_word_rows(path: Path) -> list[list[str]]:
 
 def desksharing_user_map(conn) -> dict[str, int | None]:
     grouped = defaultdict(list)
-    for user in get_users(conn):
+    for user in get_desksharing_users(conn):
         grouped[user["first_name"].strip().casefold()].append(user["id"])
     return {
         first_name: user_ids[0] if len(user_ids) == 1 else None

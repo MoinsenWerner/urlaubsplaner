@@ -75,7 +75,7 @@ def test_admin_can_create_user_with_multiple_roles(client):
             "username": "max",
             "first_name": "Max",
             "last_name": "Muster",
-            "roles": ["azubi", "normal"],
+            "roles": ["azubi", "normal", "desksharing"],
         },
         follow_redirects=True,
     )
@@ -87,7 +87,7 @@ def test_admin_can_create_user_with_multiple_roles(client):
                 "SELECT role FROM user_roles WHERE user_id = 2 ORDER BY role"
             )
         ]
-    assert roles == ["azubi", "normal"]
+    assert roles == ["azubi", "desksharing", "normal"]
     with vacation_app.db() as conn:
         user = conn.execute("SELECT * FROM users WHERE id = 2").fetchone()
     password = vacation_app.reveal_initial_password(user)
@@ -348,10 +348,10 @@ def test_desksharing_docx_import_uses_iso_week_and_first_names(client, tmp_path)
     login(client)
     with vacation_app.db() as conn:
         anna_id = vacation_app.create_user(
-            conn, "anna", "Anna", "Muster", "password", ["normal"]
+            conn, "anna", "Anna", "Muster", "password", ["normal", "desksharing"]
         )
         ben_id = vacation_app.create_user(
-            conn, "ben", "Ben", "Beispiel", "password", ["normal"]
+            conn, "ben", "Ben", "Beispiel", "password", ["normal", "desksharing"]
         )
     document = Document()
     document.add_paragraph("KW 32")
@@ -389,7 +389,10 @@ def test_legacy_word_text_import_and_admin_desksharing_edit(client, tmp_path):
     login(client)
     with vacation_app.db() as conn:
         user_id = vacation_app.create_user(
-            conn, "lea", "Lea", "Muster", "password", ["normal"]
+            conn, "lea", "Lea", "Muster", "password", ["normal", "desksharing"]
+        )
+        vacation_app.create_user(
+            conn, "outsider", "Nicht", "Aufgelistet", "password", ["normal"]
         )
     path = tmp_path / "Desksharing-Detaillierung.doc"
     path.write_text("KW 33\nMontag\nHomeoffice: Lea\n", encoding="utf-8")
@@ -406,6 +409,8 @@ def test_legacy_word_text_import_and_admin_desksharing_edit(client, tmp_path):
     planner = client.get("/desksharing?year=2026")
     assert b"Desksharing 2026" in planner.data
     assert b"Anwesend" in planner.data
+    assert b"Lea Muster" in planner.data
+    assert b"Nicht Aufgelistet" not in planner.data
 
     client.get("/logout")
     login(client, "lea", "password")
