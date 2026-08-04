@@ -352,25 +352,22 @@ def test_profile_picture_appears_in_navbar_and_matrix_but_not_export(client):
     workbook = load_workbook(BytesIO(workbook_response.data))
     assert workbook.active._images == []
     assert "urlaubsuebersicht_" in workbook_response.headers["Content-Disposition"]
-    assert ".xlsm" in workbook_response.headers["Content-Disposition"]
+    assert ".xlsx" in workbook_response.headers["Content-Disposition"]
     assert (
-        workbook_response.mimetype == "application/vnd.ms-excel.sheet.macroEnabled.12"
+        workbook_response.mimetype
+        == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
     with ZipFile(BytesIO(workbook_response.data)) as archive:
         content_types = archive.read("[Content_Types].xml")
         relationships = archive.read("xl/_rels/workbook.xml.rels")
-        embedded_vba = archive.read("xl/vbaProject.bin")
-    assert b"application/vnd.ms-excel.sheet.macroEnabled.main+xml" in content_types
-    assert b"application/vnd.ms-office.vbaProject" in content_types
-    assert b"relationships/vbaProject" in relationships
-    assert embedded_vba == vacation_app.bundled_vba_project()
-    assert embedded_vba.startswith(bytes.fromhex("D0CF11E0A1B11AE1"))
-    macro_source = (
-        Path(__file__).resolve().parents[1]
-        / "Urlaubsuebersicht_Layoutmakro_Fixierung_A_und_Zeilen_1_bis_4.bas"
-    ).read_text()
-    assert "Public Sub Urlaubsuebersicht()" in macro_source
-    assert 'Range("B5").Select' in macro_source
+        archive_names = archive.namelist()
+    assert (
+        b"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+        in content_types
+    )
+    assert b"application/vnd.ms-office.vbaProject" not in content_types
+    assert b"relationships/vbaProject" not in relationships
+    assert "xl/vbaProject.bin" not in archive_names
 
     deleted = client.post(
         "/profile",
