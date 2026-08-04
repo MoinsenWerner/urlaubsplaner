@@ -215,6 +215,31 @@ def init_db() -> None:
                 PRIMARY KEY (matrix_name, user_id),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS entry_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                import_code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                matrix_color TEXT NOT NULL,
+                matrix_code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                button_name TEXT NOT NULL,
+                export_code TEXT NOT NULL,
+                export_color TEXT NOT NULL,
+                export_description TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entry_mapping_roles (
+                mapping_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                visible INTEGER NOT NULL DEFAULT 0,
+                matrix_code TEXT,
+                matrix_color TEXT,
+                export_code TEXT,
+                export_color TEXT,
+                PRIMARY KEY (mapping_id, role),
+                FOREIGN KEY (mapping_id) REFERENCES entry_mappings(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
@@ -229,6 +254,7 @@ def init_db() -> None:
         for column, definition in migrations.items():
             if column not in columns:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+        seed_entry_mappings(conn)
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             user_id = create_user(
                 conn, "admin", "Admin", "Benutzer", "admin", ["admin"]
@@ -301,6 +327,109 @@ def initial_link(username: str, password: str) -> str:
 def normalized_roles(roles: list[str]) -> list[str]:
     valid = [role for role in ROLE_ORDER if role in roles]
     return valid or ["normal"]
+
+
+def seed_entry_mappings(conn) -> None:
+    if conn.execute(
+        "SELECT 1 FROM app_metadata WHERE key = 'entry_mappings_seeded'"
+    ).fetchone():
+        return
+    import_codes = {
+        matrix_code: import_code
+        for import_code, matrix_code in IMPORT_VALUE_TO_CODE.items()
+        if matrix_code
+    }
+    for matrix_code, (description, color) in ENTRY_TYPES.items():
+        conn.execute(
+            """INSERT OR IGNORE INTO entry_mappings(
+                import_code, matrix_color, matrix_code, button_name,
+                export_code, export_color, export_description
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                import_codes.get(matrix_code, matrix_code),
+                color,
+                matrix_code,
+                description,
+                matrix_code,
+                color,
+                description,
+            ),
+        )
+        mapping = conn.execute(
+            "SELECT id FROM entry_mappings WHERE matrix_code = ?", (matrix_code,)
+        ).fetchone()
+        if not mapping:
+            continue
+        for role in ROLE_ORDER:
+            conn.execute(
+                """INSERT OR IGNORE INTO entry_mapping_roles(mapping_id, role, visible)
+                   VALUES (?, ?, ?)""",
+                (
+                    mapping["id"],
+                    role,
+                    int(matrix_code in ALLOWED_BY_ROLE.get(role, set())),
+                ),
+            )
+    conn.execute(
+        "INSERT INTO app_metadata(key, value) VALUES ('entry_mappings_seeded', '1')"
+    )
+
+
+def get_entry_mappings(conn) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM entry_mappings ORDER BY matrix_code COLLATE NOCASE"
+    ).fetchall()
+
+
+def mapping_roles(conn, mapping_id: int) -> dict[str, sqlite3.Row]:
+    return {
+        row["role"]: row
+        for row in conn.execute(
+            "SELECT * FROM entry_mapping_roles WHERE mapping_id = ?", (mapping_id,)
+        )
+    }
+
+
+def resolved_mapping(conn, mapping: sqlite3.Row, user: User) -> dict[str, str]:
+    result = dict(mapping)
+    role_rows = mapping_roles(conn, mapping["id"])
+    for role in ROLE_ORDER:
+        if role not in user.roles:
+            continue
+        override = role_rows.get(role)
+        if override:
+            for field in ("matrix_code", "matrix_color", "export_code", "export_color"):
+                if override[field]:
+                    result[field] = override[field]
+            break
+    return result
+
+
+def mappings_for_user(conn, user: User) -> dict[str, dict[str, str]]:
+    return {
+        mapping["matrix_code"]: resolved_mapping(conn, mapping, user)
+        for mapping in get_entry_mappings(conn)
+    }
+
+
+def allowed_codes(user: User, conn=None) -> list[str]:
+    owns_connection = conn is None
+    connection = conn or db()
+    try:
+        placeholders = ",".join("?" for _ in user.roles)
+        if not placeholders:
+            return []
+        rows = connection.execute(
+            f"""SELECT DISTINCT em.matrix_code
+                FROM entry_mappings em JOIN entry_mapping_roles er ON er.mapping_id = em.id
+                WHERE er.visible = 1 AND er.role IN ({placeholders})
+                ORDER BY em.id""",
+            user.roles,
+        ).fetchall()
+        return [row["matrix_code"] for row in rows]
+    finally:
+        if owns_connection:
+            connection.close()
 
 
 @login_manager.user_loader
@@ -393,17 +522,24 @@ def order_matrix_users(
 
 
 def visible_code(
-    viewer: User, target_user_id: int, target_roles: list[str], code: str
+    viewer: User,
+    target_user_id: int,
+    target_roles: list[str],
+    code: str,
+    mapping_lookup: dict[str, dict[str, str]],
 ) -> tuple[str, str]:
-    color = ENTRY_TYPES[code][1]
-    if code == "KR":
+    mapping = mapping_lookup.get(code)
+    if not mapping:
+        return "", ""
+    color = mapping["matrix_color"]
+    if code == "KR" and color == ENTRY_TYPES["KR"][1]:
         if (
             viewer.has_role("admin")
             or target_user_id == int(viewer.id)
             or (viewer.has_role("ausbilder") and "azubi" in target_roles)
         ):
             color = SPECIAL_KR
-    return code if viewer.has_role("admin") else "", color
+    return mapping["matrix_code"] if viewer.has_role("admin") else "", color
 
 
 def month_spans(days: list[date]) -> list[dict[str, int | str]]:
@@ -437,19 +573,23 @@ def cell_style_and_tooltip(
     target_roles: list[str],
     day: date,
     codes: list[str],
+    mapping_lookup: dict[str, dict[str, str]],
 ) -> tuple[str, str]:
     if not codes:
         return "", ""
     code = codes[-1]
-    label, default_color = ENTRY_TYPES[code]
-    _, color = visible_code(viewer, target_user_id, target_roles, code)
+    mapping = mapping_lookup.get(code)
+    if not mapping:
+        return "", ""
+    label = mapping["button_name"]
+    _, color = visible_code(viewer, target_user_id, target_roles, code, mapping_lookup)
     if viewer.has_role("admin"):
-        entry_text = f"{code} – {label}"
+        entry_text = f"{mapping['matrix_code']} – {label}"
     elif code == "KR" and color != SPECIAL_KR:
         entry_text = "Abwesend"
     else:
         entry_text = label
-    return default_color if code != "KR" else color, f"{day:%d.%m.%Y}: {entry_text}"
+    return color, f"{day:%d.%m.%Y}: {entry_text}"
 
 
 def school_vacations_bavaria(years: set[int]) -> dict[str, str]:
@@ -495,13 +635,6 @@ def school_vacations_bavaria(years: set[int]) -> dict[str, str]:
 def bavarian_holidays(years: set[int]) -> dict[str, str]:
     by = holidays.Germany(subdiv="BY", years=years, language="de")
     return {d.isoformat(): name for d, name in by.items() if d.weekday() < 5}
-
-
-def allowed_codes(user: User) -> list[str]:
-    codes = set()
-    for role in user.roles:
-        codes |= ALLOWED_BY_ROLE.get(role, set())
-    return [code for code in ENTRY_TYPES if code in codes]
 
 
 def may_edit(user: User, target_id: int, code: str) -> bool:
@@ -673,6 +806,8 @@ def index():
     with db() as conn:
         users = order_matrix_users(conn, get_users(conn), "vacation")
         role_map = roles_for_users(conn)
+        mapping_lookup = mappings_for_user(conn, current_user)
+        permitted_codes = allowed_codes(current_user, conn)
         entries = conn.execute(
             "SELECT * FROM entries WHERE entry_date BETWEEN ? AND ?",
             (start.isoformat(), end.isoformat()),
@@ -687,15 +822,23 @@ def index():
         role_map=role_map,
         days=days,
         entries=entry_map,
-        entry_types=ENTRY_TYPES,
+        entry_types={
+            code: (
+                mapping["button_name"],
+                mapping["matrix_color"],
+                mapping["matrix_code"],
+            )
+            for code, mapping in mapping_lookup.items()
+        },
         holidays=bavarian_holidays(years),
         vacations=school_vacations_bavaria(years),
         holiday_color=HOLIDAY_COLOR,
         vacation_color=VACATION_COLOR,
-        allowed_codes=allowed_codes(current_user),
+        allowed_codes=permitted_codes,
         today_monday=today_monday,
         visible_code=visible_code,
         cell_style_and_tooltip=cell_style_and_tooltip,
+        mapping_lookup=mapping_lookup,
         month_spans=month_spans(days),
         year_spans=year_spans(days),
         year=year,
@@ -709,9 +852,12 @@ def entry():
     target_id = int(request.form["user_id"])
     entry_date = request.form["date"]
     code = request.form["code"]
-    if code not in ENTRY_TYPES or not may_edit(current_user, target_id, code):
-        abort(403)
     with db() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM entry_mappings WHERE matrix_code = ?", (code,)
+        ).fetchone()
+        if not exists or not may_edit(current_user, target_id, code):
+            abort(403)
         if request.form.get("action") == "delete":
             conn.execute(
                 "DELETE FROM entries WHERE user_id = ? AND entry_date = ? AND code = ?",
@@ -734,18 +880,23 @@ def bulk_entry():
     delete = payload.get("delete", False)
     if not cells:
         return jsonify({"updated": 0})
-    if not delete and code not in ENTRY_TYPES:
-        abort(400)
     updated = 0
     with db() as conn:
+        if (
+            not delete
+            and not conn.execute(
+                "SELECT 1 FROM entry_mappings WHERE matrix_code = ?", (code,)
+            ).fetchone()
+        ):
+            abort(400)
         for cell in cells:
             target_id = int(cell["user_id"])
             entry_date = cell["date"]
             if delete:
                 removable_codes = (
-                    ENTRY_TYPES
+                    [mapping["matrix_code"] for mapping in get_entry_mappings(conn)]
                     if current_user.has_role("admin")
-                    else allowed_codes(current_user)
+                    else allowed_codes(current_user, conn)
                 )
                 for removable_code in removable_codes:
                     if may_edit(current_user, target_id, removable_code):
@@ -840,6 +991,152 @@ def members():
         role_map=role_map,
         roles=ROLE_ORDER,
         credentials=credentials,
+    )
+
+
+def normalized_color(value: str) -> str | None:
+    color = value.strip().lstrip("#").upper()
+    return color if re.fullmatch(r"[0-9A-F]{6}", color) else None
+
+
+@app.route("/entry-mappings", methods=["GET", "POST"])
+@login_required
+def entry_mappings():
+    if not current_user.has_role("admin"):
+        abort(403)
+    edit_id = request.args.get("edit", type=int)
+    with db() as conn:
+        if request.method == "POST":
+            mapping_id = request.form.get("mapping_id", type=int)
+            fields = {
+                "import_code": request.form.get("import_code", "").strip(),
+                "matrix_code": request.form.get("matrix_code", "").strip(),
+                "matrix_color": normalized_color(request.form.get("matrix_color", "")),
+                "button_name": request.form.get("button_name", "").strip(),
+                "export_code": request.form.get("export_code", "").strip(),
+                "export_color": normalized_color(request.form.get("export_color", "")),
+                "export_description": request.form.get(
+                    "export_description", ""
+                ).strip(),
+            }
+            if not all(fields.values()):
+                flash("Bitte fülle alle Pflichtfelder gültig aus.")
+            else:
+                duplicate = conn.execute(
+                    """SELECT id FROM entry_mappings
+                       WHERE (import_code = ? COLLATE NOCASE OR matrix_code = ? COLLATE NOCASE)
+                         AND (? IS NULL OR id != ?)""",
+                    (
+                        fields["import_code"],
+                        fields["matrix_code"],
+                        mapping_id,
+                        mapping_id,
+                    ),
+                ).fetchone()
+                if duplicate:
+                    flash("Import- oder Matrixkürzel ist bereits vergeben.")
+                else:
+                    values = (
+                        fields["import_code"],
+                        fields["matrix_color"],
+                        fields["matrix_code"],
+                        fields["button_name"],
+                        fields["export_code"],
+                        fields["export_color"],
+                        fields["export_description"],
+                    )
+                    if mapping_id:
+                        old = conn.execute(
+                            "SELECT matrix_code FROM entry_mappings WHERE id = ?",
+                            (mapping_id,),
+                        ).fetchone()
+                        if not old:
+                            abort(404)
+                        conn.execute(
+                            """UPDATE entry_mappings SET import_code = ?, matrix_color = ?,
+                               matrix_code = ?, button_name = ?, export_code = ?,
+                               export_color = ?, export_description = ? WHERE id = ?""",
+                            (*values, mapping_id),
+                        )
+                        if old["matrix_code"] != fields["matrix_code"]:
+                            conn.execute(
+                                "UPDATE entries SET code = ? WHERE code = ?",
+                                (fields["matrix_code"], old["matrix_code"]),
+                            )
+                    else:
+                        cursor = conn.execute(
+                            """INSERT INTO entry_mappings(
+                               import_code, matrix_color, matrix_code, button_name,
+                               export_code, export_color, export_description
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            values,
+                        )
+                        mapping_id = cursor.lastrowid
+                    visible_roles = set(request.form.getlist("visible_roles"))
+                    for role in ROLE_ORDER:
+                        has_override = request.form.get(f"{role}__override") == "1"
+                        matrix_color = (
+                            normalized_color(
+                                request.form.get(f"{role}__matrix_color", "")
+                            )
+                            if has_override
+                            else None
+                        )
+                        export_color = (
+                            normalized_color(
+                                request.form.get(f"{role}__export_color", "")
+                            )
+                            if has_override
+                            else None
+                        )
+                        conn.execute(
+                            """INSERT INTO entry_mapping_roles(
+                               mapping_id, role, visible, matrix_code, matrix_color,
+                               export_code, export_color
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(mapping_id, role) DO UPDATE SET
+                               visible = excluded.visible,
+                               matrix_code = excluded.matrix_code,
+                               matrix_color = excluded.matrix_color,
+                               export_code = excluded.export_code,
+                               export_color = excluded.export_color""",
+                            (
+                                mapping_id,
+                                role,
+                                int(role in visible_roles),
+                                (
+                                    request.form.get(f"{role}__matrix_code", "").strip()
+                                    or None
+                                )
+                                if has_override
+                                else None,
+                                matrix_color,
+                                (
+                                    request.form.get(f"{role}__export_code", "").strip()
+                                    or None
+                                )
+                                if has_override
+                                else None,
+                                export_color,
+                            ),
+                        )
+                    flash("Zuordnung gespeichert.")
+                    return redirect(url_for("entry_mappings"))
+        mappings = get_entry_mappings(conn)
+        edit_mapping = (
+            conn.execute(
+                "SELECT * FROM entry_mappings WHERE id = ?", (edit_id,)
+            ).fetchone()
+            if edit_id
+            else None
+        )
+        edit_roles = mapping_roles(conn, edit_id) if edit_id else {}
+    return render_template(
+        "entry-mappings.html",
+        mappings=mappings,
+        edit_mapping=edit_mapping,
+        edit_roles=edit_roles,
+        roles=ROLE_ORDER,
     )
 
 
@@ -995,8 +1292,9 @@ def desksharing_bulk_entry():
     return jsonify({"updated": len(cells)})
 
 
-def fill_for(viewer: User, target_id: int, roles: list[str], code: str) -> str:
-    return visible_code(viewer, target_id, roles, code)[1]
+def fill_for(mapping_lookup: dict[str, dict[str, str]], code: str) -> str:
+    mapping = mapping_lookup.get(code)
+    return mapping["export_color"] if mapping else "FFFFFF"
 
 
 @app.post("/download")
@@ -1008,7 +1306,8 @@ def download():
     days = weekdays_between(date(start_year, 1, 1), date(end_year, 12, 31))
     with db() as conn:
         users = get_users(conn)
-        role_map = roles_for_users(conn)
+        mapping_lookup = mappings_for_user(conn, current_user)
+        permitted_codes = set(allowed_codes(current_user, conn))
         entries = conn.execute(
             "SELECT * FROM entries WHERE entry_date BETWEEN ? AND ?",
             (days[0].isoformat(), days[-1].isoformat()),
@@ -1043,25 +1342,35 @@ def download():
         ws.cell(row_no, 1, f"{user['first_name']} {user['last_name']}")
         for col, day in enumerate(days, 2):
             for code in entry_map.get((user["id"], day.isoformat()), []):
-                ws.cell(row_no, col, code if current_user.has_role("admin") else "")
+                mapping = mapping_lookup.get(code)
+                if not mapping:
+                    continue
+                ws.cell(
+                    row_no,
+                    col,
+                    mapping["export_code"]
+                    if current_user.has_role("admin") or code in permitted_codes
+                    else "",
+                )
                 ws.cell(row_no, col).fill = PatternFill(
                     "solid",
-                    fgColor=fill_for(
-                        current_user, user["id"], role_map[user["id"]], code
-                    ),
+                    fgColor=fill_for(mapping_lookup, code),
                 )
                 break
         row_no += 1
     legend = row_no + 2
     ws.cell(legend, 1, "Legende")
-    for idx, (code, (label, color)) in enumerate(ENTRY_TYPES.items(), legend + 1):
-        ws.cell(idx, 1, code)
-        ws.cell(idx, 2, label)
+    export_mappings = [
+        mapping
+        for code, mapping in mapping_lookup.items()
+        if current_user.has_role("admin") or code in permitted_codes
+    ]
+    for idx, mapping in enumerate(export_mappings, legend + 1):
+        ws.cell(idx, 1, mapping["export_code"])
+        ws.cell(idx, 2, mapping["export_description"])
         ws.cell(idx, 3).fill = PatternFill(
             "solid",
-            fgColor=SPECIAL_KR
-            if code == "KR" and current_user.has_role("admin")
-            else color,
+            fgColor=mapping["export_color"],
         )
     stream = BytesIO()
     wb.save(stream)
@@ -1278,15 +1587,17 @@ def excel_fill_key(cell) -> tuple | None:
     return None
 
 
-def build_legend_fill_map(ws) -> dict[tuple, str | None]:
+def build_legend_fill_map(
+    ws, label_to_code: dict[str, str | None]
+) -> dict[tuple, str | None]:
     result = {}
     for row in ws.iter_rows():
         label = str(row[0].value).strip().casefold() if row[0].value else ""
-        if label not in IMPORT_LEGEND_LABEL_TO_CODE:
+        if label not in label_to_code:
             continue
         fill_key = excel_fill_key(row[0])
         if fill_key:
-            result[fill_key] = IMPORT_LEGEND_LABEL_TO_CODE[label]
+            result[fill_key] = label_to_code[label]
     return result
 
 
@@ -1382,9 +1693,26 @@ def import_excel(path: Path) -> None:
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     date_row, date_columns = find_excel_date_columns(ws)
-    legend_fill_map = build_legend_fill_map(ws)
     actor_id = getattr(current_user, "id", None)
     with db() as conn:
+        mappings = get_entry_mappings(conn)
+        import_map = {
+            mapping["import_code"].casefold(): mapping["matrix_code"]
+            for mapping in mappings
+        }
+        label_to_code = {
+            mapping["button_name"].casefold(): mapping["matrix_code"]
+            for mapping in mappings
+        }
+        label_to_code.update(
+            {
+                label: code
+                for label, code in IMPORT_LEGEND_LABEL_TO_CODE.items()
+                if code is None
+                or any(mapping["matrix_code"] == code for mapping in mappings)
+            }
+        )
+        legend_fill_map = build_legend_fill_map(ws, label_to_code)
         for row in ws.iter_rows(min_row=date_row + 1):
             row_label = str(row[0].value).strip() if row[0].value else ""
             if not row_label or row_label.lower() in IGNORED_IMPORT_NAMES:
@@ -1403,7 +1731,7 @@ def import_excel(path: Path) -> None:
             for cell in row[1:]:
                 entry_date = date_columns.get(cell.column)
                 raw_value = str(cell.value).strip() if cell.value else ""
-                code = IMPORT_VALUE_TO_CODE_NORMALIZED.get(raw_value.casefold())
+                code = import_map.get(raw_value.casefold())
                 if code is None and raw_value.replace("\xa0", "") == "":
                     code = legend_fill_map.get(excel_fill_key(cell))
                 if code and entry_date:

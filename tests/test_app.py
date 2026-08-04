@@ -533,6 +533,150 @@ def test_matrix_order_rejects_incomplete_user_lists(client):
     )
 
 
+def test_admin_can_create_edit_and_protect_entry_mappings(client):
+    login(client)
+    page = client.get("/entry-mappings")
+    assert page.status_code == 200
+    assert b"Zuordnungen verwalten" in page.data
+    assert b"UrlbGplntOdrBntrgt" in page.data
+
+    mapping_data = {
+        "import_code": "ImportTest",
+        "matrix_color": "#112233",
+        "matrix_code": "TX",
+        "button_name": "Testzeit",
+        "export_code": "TEX",
+        "export_color": "#445566",
+        "export_description": "Testzeit Export",
+        "visible_roles": ["normal", "azubi"],
+        "azubi__override": "1",
+        "azubi__matrix_code": "AZTX",
+        "azubi__matrix_color": "#123456",
+        "azubi__export_code": "AZEX",
+        "azubi__export_color": "#654321",
+    }
+    created = client.post("/entry-mappings", data=mapping_data, follow_redirects=True)
+    assert b"Zuordnung gespeichert" in created.data
+    with vacation_app.db() as conn:
+        mapping = conn.execute(
+            "SELECT * FROM entry_mappings WHERE matrix_code = 'TX'"
+        ).fetchone()
+        roles = vacation_app.mapping_roles(conn, mapping["id"])
+    assert mapping["matrix_color"] == "112233"
+    assert roles["normal"]["visible"] == 1
+    assert roles["admin"]["visible"] == 0
+    assert roles["azubi"]["matrix_code"] == "AZTX"
+    assert roles["azubi"]["export_color"] == "654321"
+
+    duplicate_data = dict(mapping_data, matrix_code="OTHER")
+    duplicate = client.post(
+        "/entry-mappings", data=duplicate_data, follow_redirects=True
+    )
+    assert b"bereits vergeben" in duplicate.data
+    with vacation_app.db() as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM entry_mappings WHERE import_code = 'ImportTest'"
+            ).fetchone()[0]
+            == 1
+        )
+
+    with vacation_app.db() as conn:
+        conn.execute(
+            "INSERT INTO entries(user_id, entry_date, code, created_by) VALUES (1, ?, 'TX', 1)",
+            (date.today().isoformat(),),
+        )
+    edited_data = dict(mapping_data, mapping_id=mapping["id"], matrix_code="TY")
+    edited = client.post("/entry-mappings", data=edited_data, follow_redirects=True)
+    assert b"Zuordnung gespeichert" in edited.data
+    with vacation_app.db() as conn:
+        assert (
+            conn.execute(
+                "SELECT code FROM entries WHERE user_id = 1 AND entry_date = ?",
+                (date.today().isoformat(),),
+            ).fetchone()["code"]
+            == "TY"
+        )
+        assert (
+            conn.execute(
+                "SELECT 1 FROM entry_mappings WHERE matrix_code = 'TX'"
+            ).fetchone()
+            is None
+        )
+
+
+def test_role_specific_mapping_controls_matrix_import_and_export(client, tmp_path):
+    login(client)
+    client.post(
+        "/entry-mappings",
+        data={
+            "import_code": "RoleImport",
+            "matrix_color": "#112233",
+            "matrix_code": "RX",
+            "button_name": "Rollenzeit",
+            "export_code": "REX",
+            "export_color": "#445566",
+            "export_description": "Rollenzeit Export",
+            "visible_roles": ["azubi"],
+            "azubi__override": "1",
+            "azubi__matrix_code": "AZRX",
+            "azubi__matrix_color": "#123456",
+            "azubi__export_code": "AZEX",
+            "azubi__export_color": "#654321",
+        },
+    )
+    with vacation_app.db() as conn:
+        user_id = vacation_app.create_user(
+            conn, "mapping.azubi", "Mapping", "Azubi", "password", ["azubi"]
+        )
+
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Name", date.today()])
+    sheet.append(["Mapping Azubi", "RoleImport"])
+    path = tmp_path / "role-import.xlsx"
+    workbook.save(path)
+    vacation_app.import_excel(path)
+    with vacation_app.db() as conn:
+        assert (
+            conn.execute(
+                "SELECT code FROM entries WHERE user_id = ?", (user_id,)
+            ).fetchone()["code"]
+            == "RX"
+        )
+
+    client.get("/logout")
+    login(client, "mapping.azubi", "password")
+    planner = client.get("/")
+    assert b"AZRX" in planner.data
+    assert b"--legend-color:#123456" in planner.data
+    exported = client.post(
+        "/download",
+        data={"start_year": date.today().year, "end_year": date.today().year},
+    )
+    exported_workbook = load_workbook(BytesIO(exported.data))
+    sheet = exported_workbook.active
+    values = [cell.value for row in sheet.iter_rows() for cell in row]
+    assert "AZEX" in values
+    export_cell = next(
+        cell for row in sheet.iter_rows() for cell in row if cell.value == "AZEX"
+    )
+    assert export_cell.fill.fgColor.rgb.endswith("654321")
+
+    client.get("/logout")
+    login(client)
+    with vacation_app.db() as conn:
+        vacation_app.create_user(
+            conn, "mapping.normal", "Mapping", "Normal", "password", ["normal"]
+        )
+    client.get("/logout")
+    login(client, "mapping.normal", "password")
+    assert b"AZRX" not in client.get("/").data
+    assert client.get("/entry-mappings").status_code == 403
+
+
 def test_repo_example_excel_imports_entries(client):
     login(client)
     example = (
