@@ -322,6 +322,66 @@ def test_bulk_roles_and_ausbilder_may_only_reset_azubi(client):
     )
 
 
+def test_admin_can_change_existing_user_email_addresses(client):
+    login(client)
+    user_id, _ = create_initial_member(client, "mailchange", ["normal"])
+    page = client.get("/members")
+    assert b'name="email_1"' in page.data
+    assert f'name="email_{user_id}"'.encode() in page.data
+
+    response = client.post(
+        "/members",
+        data={
+            "action": "emails-bulk",
+            "email_1": "new-admin@example.org",
+            f"email_{user_id}": "changed.user@example.org",
+        },
+        follow_redirects=True,
+    )
+    assert b"E-Mail-Adressen wurden aktualisiert" in response.data
+    with vacation_app.db() as conn:
+        emails = {
+            row["id"]: row["email"]
+            for row in conn.execute("SELECT id, email FROM users ORDER BY id")
+        }
+    assert emails[1] == "new-admin@example.org"
+    assert emails[user_id] == "changed.user@example.org"
+
+
+def test_email_bulk_update_rejects_invalid_values_and_non_admins(client):
+    login(client)
+    user_id, _ = create_initial_member(client, "mailinvalid", ["normal"])
+    response = client.post(
+        "/members",
+        data={
+            "action": "emails-bulk",
+            "email_1": "admin.benutzer@m-a-i.de",
+            f"email_{user_id}": "ungueltig",
+        },
+        follow_redirects=True,
+    )
+    assert b"g\xc3\xbcltige E-Mail-Adresse" in response.data
+    with vacation_app.db() as conn:
+        assert (
+            conn.execute("SELECT email FROM users WHERE id = ?", (user_id,)).fetchone()[
+                "email"
+            ]
+            == "mailinvalid.muster@m-a-i.de"
+        )
+        trainer_id = vacation_app.create_user(
+            conn, "email.trainer", "Email", "Trainer", "password", ["ausbilder"]
+        )
+    client.get("/logout")
+    login(client, "email.trainer", "password")
+    assert (
+        client.post(
+            "/members",
+            data={"action": "emails-bulk", f"email_{trainer_id}": "x@example.org"},
+        ).status_code
+        == 403
+    )
+
+
 def test_profile_email_is_generated_and_immutable(client):
     login(client)
     profile = client.get("/profile")

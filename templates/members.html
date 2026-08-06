@@ -16,12 +16,12 @@
   {% endif %}
 
   <form method="post">
-    <input type="hidden" name="action" value="roles-bulk">
     <table class="members-table">
-      <thead><tr><th>Name</th><th>Benutzername</th><th>Rollen</th><th>Aktionen</th></tr></thead>
+      <thead><tr><th>Name</th><th>Benutzername</th><th>E-Mail-Adresse</th><th>Rollen</th><th>Aktionen</th></tr></thead>
       <tbody>{% for user in users %}<tr>
         <td>{{ user.last_name }}, {{ user.first_name }}</td>
         <td>{{ user.username }}</td>
+        <td>{% if current_user.has_role('admin') %}<input class="member-email" type="email" name="email_{{ user.id }}" value="{{ user.email }}" required>{% else %}{{ user.email }}{% endif %}</td>
         <td>{% for role in roles %}<label><input type="checkbox" name="roles_{{ user.id }}" value="{{ role }}" {% if role in role_map[user.id] %}checked{% endif %} {% if not current_user.has_role('admin') %}disabled{% endif %}> {{ role }}</label>{% endfor %}</td>
         <td class="member-actions">
           {% if current_user.has_role('admin') or (current_user.has_role('ausbilder') and 'azubi' in role_map[user.id]) %}
@@ -32,7 +32,7 @@
         </td>
       </tr>{% endfor %}</tbody>
     </table>
-    {% if current_user.has_role('admin') %}<button class="primary roles-update">Rollen updaten</button>{% endif %}
+    {% if current_user.has_role('admin') %}<button class="primary roles-update" name="action" value="roles-bulk">Rollen updaten</button> <button class="primary roles-update" name="action" value="emails-bulk">E-Mail-Adressen speichern</button>{% endif %}
   </form>
   {% for user in users %}
     <form id="reset-{{ user.id }}" method="post"><input type="hidden" name="action" value="reset-password"><input type="hidden" name="user_id" value="{{ user.id }}"></form>

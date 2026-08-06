@@ -1296,6 +1296,27 @@ def members():
                             (user["id"], role),
                         )
                 flash("Rollen wurden aktualisiert.")
+            elif action == "emails-bulk":
+                if not current_user.has_role("admin"):
+                    abort(403)
+                email_updates = {
+                    user["id"]: request.form.get(f"email_{user['id']}", "").strip()
+                    for user in get_users(conn)
+                }
+                invalid_users = [
+                    user_id
+                    for user_id, email in email_updates.items()
+                    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+                ]
+                if invalid_users:
+                    flash("Bitte gib für alle Nutzer eine gültige E-Mail-Adresse ein.")
+                else:
+                    for user_id, email in email_updates.items():
+                        conn.execute(
+                            "UPDATE users SET email = ? WHERE id = ?",
+                            (email, user_id),
+                        )
+                    flash("E-Mail-Adressen wurden aktualisiert.")
             elif action in {"reset-password", "show-initial"}:
                 target = member_password_target(conn, int(request.form["user_id"]))
                 if not target:
