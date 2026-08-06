@@ -22,6 +22,7 @@ def client(tmp_path, monkeypatch):
         DKIM_SELECTOR="urlaubsplaner",
         DKIM_PRIVATE_KEY=str(tmp_path / "dkim_private.pem"),
         MAIL_MAX_ATTEMPTS=8,
+        MAIL_IPV4_ONLY=True,
         INITIAL_ADMIN_PASSWORD="admin",
     )
     vacation_app.init_db()
@@ -398,9 +399,14 @@ def test_initial_credentials_are_dkim_signed_and_delivered_directly(
         preference = 10
         exchange = "mx.m-a-i.de."
 
+    class AAnswer:
+        address = "192.0.2.25"
+
     monkeypatch.setattr(vacation_app.smtplib, "SMTP", FakeSmtp)
     monkeypatch.setattr(
-        vacation_app.dns.resolver, "resolve", lambda _domain, _kind: [MxAnswer()]
+        vacation_app.dns.resolver,
+        "resolve",
+        lambda _domain, kind: [MxAnswer()] if kind == "MX" else [AAnswer()],
     )
     login(client)
     create_initial_member(client, username="mail.user")
@@ -413,7 +419,7 @@ def test_initial_credentials_are_dkim_signed_and_delivered_directly(
     assert vacation_app.deliver_outbox_once() is True
 
     assert sent["starttls"] is True
-    assert sent["host"] == "mx.m-a-i.de"
+    assert sent["host"] == "192.0.2.25"
     assert sent["port"] == 25
     assert sent["local_hostname"] == "mail.extrahelden.de"
     assert sent["from_addr"] == "noreply@extrahelden.de"
@@ -424,6 +430,55 @@ def test_initial_credentials_are_dkim_signed_and_delivered_directly(
         ).fetchone()
     assert delivered["status"] == "delivered"
     assert delivered["attempts"] == 0
+
+
+def test_permanent_smtp_rejection_is_not_retried(client, monkeypatch):
+    class RejectingSmtp:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def ehlo(self, _hostname):
+            pass
+
+        def has_extn(self, _extension):
+            return False
+
+        def sendmail(self, _from_addr, recipients, _message):
+            raise vacation_app.smtplib.SMTPRecipientsRefused(
+                {recipients[0]: (550, b"5.5.0 mailbox unavailable")}
+            )
+
+    class MxAnswer:
+        preference = 10
+        exchange = "mx.example.net."
+
+    class AAnswer:
+        address = "192.0.2.30"
+
+    monkeypatch.setattr(vacation_app.smtplib, "SMTP", RejectingSmtp)
+    monkeypatch.setattr(
+        vacation_app.dns.resolver,
+        "resolve",
+        lambda _domain, kind: [MxAnswer()] if kind == "MX" else [AAnswer()],
+    )
+    login(client)
+    create_initial_member(client, username="missing.mailbox")
+
+    assert vacation_app.deliver_outbox_once() is True
+    assert vacation_app.deliver_outbox_once() is False
+    with vacation_app.db() as conn:
+        failed = conn.execute(
+            "SELECT status, attempts, last_error FROM mail_outbox"
+        ).fetchone()
+    assert failed["status"] == "failed"
+    assert failed["attempts"] == 1
+    assert "Dauerhafte Ablehnung" in failed["last_error"]
 
 
 def test_profile_picture_appears_in_navbar_and_matrix_but_not_export(client):

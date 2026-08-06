@@ -164,6 +164,11 @@ app.config["DKIM_PRIVATE_KEY"] = os.environ.get(
 )
 app.config["MAIL_WORKER_INTERVAL"] = float(os.environ.get("MAIL_WORKER_INTERVAL", "10"))
 app.config["MAIL_MAX_ATTEMPTS"] = int(os.environ.get("MAIL_MAX_ATTEMPTS", "8"))
+app.config["MAIL_IPV4_ONLY"] = os.environ.get("MAIL_IPV4_ONLY", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 app.config["INITIAL_ADMIN_PASSWORD"] = os.environ.get("INITIAL_ADMIN_PASSWORD", "")
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
@@ -484,25 +489,70 @@ def recipient_mail_servers(recipient: str) -> list[str]:
     return [server for _, server in sorted(servers)]
 
 
+class MailDeliveryError(RuntimeError):
+    def __init__(self, message: str, *, permanent: bool):
+        super().__init__(message)
+        self.permanent = permanent
+
+
+def smtp_error_is_permanent(error: smtplib.SMTPException) -> bool:
+    if isinstance(error, smtplib.SMTPRecipientsRefused):
+        return bool(error.recipients) and all(
+            500 <= response[0] < 600 for response in error.recipients.values()
+        )
+    return (
+        isinstance(error, smtplib.SMTPResponseException)
+        and 500 <= error.smtp_code < 600
+    )
+
+
+def mail_server_targets(server: str) -> list[str]:
+    if not app.config["MAIL_IPV4_ONLY"]:
+        return [server]
+    try:
+        return [answer.address for answer in dns.resolver.resolve(server, "A")]
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN) as exc:
+        raise MailDeliveryError(
+            f"MX-Server {server} besitzt keine IPv4-Adresse.", permanent=False
+        ) from exc
+
+
 def deliver_raw_email(recipient: str, raw_message: bytes) -> None:
     servers = recipient_mail_servers(recipient)
     if not servers:
-        raise RuntimeError("Empfängerdomain akzeptiert keine E-Mails (Null MX).")
+        raise MailDeliveryError(
+            "Empfängerdomain akzeptiert keine E-Mails (Null MX).", permanent=True
+        )
     last_error: Exception | None = None
     for server in servers:
-        try:
-            with smtplib.SMTP(
-                server, 25, local_hostname=app.config["MAIL_HOSTNAME"], timeout=30
-            ) as smtp:
-                smtp.ehlo(app.config["MAIL_HOSTNAME"])
-                if smtp.has_extn("starttls"):
-                    smtp.starttls(context=ssl.create_default_context())
+        for target in mail_server_targets(server):
+            try:
+                with smtplib.SMTP(
+                    target,
+                    25,
+                    local_hostname=app.config["MAIL_HOSTNAME"],
+                    timeout=30,
+                ) as smtp:
+                    # Preserve the MX hostname for TLS certificate verification even
+                    # when an IPv4 address was selected explicitly for the connection.
+                    smtp._host = server
                     smtp.ehlo(app.config["MAIL_HOSTNAME"])
-                smtp.sendmail(app.config["MAIL_FROM"], [recipient], raw_message)
-            return
-        except (OSError, smtplib.SMTPException) as exc:
-            last_error = exc
-    raise RuntimeError(f"Alle MX-Server fehlgeschlagen: {last_error}")
+                    if smtp.has_extn("starttls"):
+                        smtp.starttls(context=ssl.create_default_context())
+                        smtp.ehlo(app.config["MAIL_HOSTNAME"])
+                    smtp.sendmail(app.config["MAIL_FROM"], [recipient], raw_message)
+                return
+            except smtplib.SMTPException as exc:
+                if smtp_error_is_permanent(exc):
+                    raise MailDeliveryError(
+                        f"Dauerhafte Ablehnung durch {server}: {exc}", permanent=True
+                    ) from exc
+                last_error = exc
+            except OSError as exc:
+                last_error = exc
+    raise MailDeliveryError(
+        f"Alle MX-Server vorübergehend fehlgeschlagen: {last_error}", permanent=False
+    )
 
 
 def deliver_outbox_once() -> bool:
@@ -523,7 +573,12 @@ def deliver_outbox_once() -> bool:
         deliver_raw_email(row["recipient"], row["message"])
     except Exception as exc:  # delivery errors must remain in the persistent queue
         attempts = row["attempts"] + 1
-        status = "failed" if attempts >= app.config["MAIL_MAX_ATTEMPTS"] else "pending"
+        permanent = isinstance(exc, MailDeliveryError) and exc.permanent
+        status = (
+            "failed"
+            if permanent or attempts >= app.config["MAIL_MAX_ATTEMPTS"]
+            else "pending"
+        )
         retry_at = now + timedelta(minutes=min(2**attempts, 360))
         with db() as conn:
             conn.execute(
@@ -537,9 +592,10 @@ def deliver_outbox_once() -> bool:
                     row["id"],
                 ),
             )
-        app.logger.warning(
-            "E-Mail %s konnte nicht zugestellt werden: %s", row["id"], exc
+        failure_kind = (
+            "dauerhaft fehlgeschlagen" if permanent else "vorübergehend fehlgeschlagen"
         )
+        app.logger.warning("E-Mail %s %s: %s", row["id"], failure_kind, exc)
     else:
         with db() as conn:
             conn.execute(
