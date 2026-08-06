@@ -7,17 +7,24 @@ import secrets
 import re
 import shutil
 import smtplib
+import ssl
 import sqlite3
 import subprocess
+import threading
+import time
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from io import BytesIO
 from pathlib import Path
 
 import holidays
+import dkim
+import dns.resolver
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from flask import (
     Flask,
     abort,
@@ -149,21 +156,14 @@ app.config["PROFILE_UPLOAD_FOLDER"] = "instance/profile-images"
 app.config["PUBLIC_BASE_URL"] = os.environ.get(
     "PUBLIC_BASE_URL", "https://urlaub.extrahelden.de"
 ).rstrip("/")
-app.config["SMTP_HOST"] = os.environ.get("SMTP_HOST", "")
-app.config["SMTP_PORT"] = int(os.environ.get("SMTP_PORT", "587"))
-app.config["SMTP_USERNAME"] = os.environ.get("SMTP_USERNAME", "")
-app.config["SMTP_PASSWORD"] = os.environ.get("SMTP_PASSWORD", "")
-app.config["SMTP_STARTTLS"] = os.environ.get("SMTP_STARTTLS", "true").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-app.config["SMTP_SSL"] = os.environ.get("SMTP_SSL", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-}
 app.config["MAIL_FROM"] = os.environ.get("MAIL_FROM", "noreply@extrahelden.de")
+app.config["MAIL_HOSTNAME"] = os.environ.get("MAIL_HOSTNAME", "mail.extrahelden.de")
+app.config["DKIM_SELECTOR"] = os.environ.get("DKIM_SELECTOR", "urlaubsplaner")
+app.config["DKIM_PRIVATE_KEY"] = os.environ.get(
+    "DKIM_PRIVATE_KEY", "instance/dkim_private.pem"
+)
+app.config["MAIL_WORKER_INTERVAL"] = float(os.environ.get("MAIL_WORKER_INTERVAL", "10"))
+app.config["MAIL_MAX_ATTEMPTS"] = int(os.environ.get("MAIL_MAX_ATTEMPTS", "8"))
 app.config["INITIAL_ADMIN_PASSWORD"] = os.environ.get("INITIAL_ADMIN_PASSWORD", "")
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
@@ -261,6 +261,16 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS app_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mail_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient TEXT NOT NULL,
+                message BLOB NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt TEXT NOT NULL,
+                last_error TEXT,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -363,7 +373,9 @@ def create_initial_user(
         conn.execute(
             "INSERT INTO user_roles(user_id, role) VALUES (?, ?)", (user_id, role)
         )
-    send_initial_credentials_email(username, password, default_email(first, last))
+    send_initial_credentials_email(
+        username, password, default_email(first, last), connection=conn
+    )
     return user_id, password
 
 
@@ -380,15 +392,12 @@ def initial_link(username: str, password: str) -> str:
 
 
 def send_initial_credentials_email(
-    username: str, password: str, recipient: str
+    username: str,
+    password: str,
+    recipient: str,
+    connection: sqlite3.Connection | None = None,
 ) -> bool:
-    """Send the one-time setup link through an authenticated SMTP relay."""
-    if not app.config["SMTP_HOST"]:
-        app.logger.info(
-            "Initialdaten-E-Mail an %s nicht versendet: SMTP_HOST ist nicht gesetzt.",
-            recipient,
-        )
-        return False
+    """Sign and queue the setup link for delivery by the local mail worker."""
     link = initial_link(username, password)
     message = EmailMessage()
     message["Subject"] = "Dein Zugang zum Urlaubsplaner"
@@ -403,23 +412,165 @@ def send_initial_credentials_email(
         f"{link}\n\n"
         "Falls du diese E-Mail nicht erwartet hast, wende dich bitte an einen Admin.\n"
     )
-    try:
-        smtp_class = smtplib.SMTP_SSL if app.config["SMTP_SSL"] else smtplib.SMTP
-        with smtp_class(
-            app.config["SMTP_HOST"], app.config["SMTP_PORT"], timeout=15
-        ) as smtp:
-            if not app.config["SMTP_SSL"] and app.config["SMTP_STARTTLS"]:
-                smtp.starttls()
-            if app.config["SMTP_USERNAME"]:
-                smtp.login(app.config["SMTP_USERNAME"], app.config["SMTP_PASSWORD"])
-            smtp.send_message(message, from_addr=app.config["MAIL_FROM"])
-    except (OSError, smtplib.SMTPException):
-        app.logger.exception(
-            "Initialdaten-E-Mail an %s konnte nicht versendet werden.", recipient
+    raw_message = sign_email(message.as_bytes())
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    if connection is not None:
+        connection.execute(
+            """INSERT INTO mail_outbox(
+                   recipient, message, status, attempts, next_attempt, created_at
+               ) VALUES (?, ?, 'pending', 0, ?, ?)""",
+            (recipient, raw_message, now, now),
         )
-        return False
-    app.logger.info("Initialdaten-E-Mail an %s versendet.", recipient)
+    else:
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO mail_outbox(
+                       recipient, message, status, attempts, next_attempt, created_at
+                   ) VALUES (?, ?, 'pending', 0, ?, ?)""",
+                (recipient, raw_message, now, now),
+            )
+    app.logger.info("Initialdaten-E-Mail an %s zur Zustellung vorgemerkt.", recipient)
     return True
+
+
+def ensure_dkim_key() -> tuple[bytes, str]:
+    """Create the persistent DKIM key and return its DNS TXT value."""
+    key_path = Path(app.config["DKIM_PRIVATE_KEY"])
+    if not key_path.exists():
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key_path.write_bytes(
+            private_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+        )
+        key_path.chmod(0o600)
+    private_bytes = key_path.read_bytes()
+    private_key = serialization.load_pem_private_key(private_bytes, password=None)
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    public_value = base64.b64encode(public_der).decode()
+    return private_bytes, f"v=DKIM1; k=rsa; p={public_value}"
+
+
+def sign_email(raw_message: bytes) -> bytes:
+    private_key, _ = ensure_dkim_key()
+    domain = app.config["MAIL_FROM"].rsplit("@", 1)[-1].encode()
+    signature = dkim.sign(
+        raw_message,
+        app.config["DKIM_SELECTOR"].encode(),
+        domain,
+        private_key,
+        include_headers=[b"from", b"to", b"subject", b"date", b"message-id"],
+    )
+    return signature + raw_message
+
+
+def recipient_mail_servers(recipient: str) -> list[str]:
+    domain = recipient.rsplit("@", 1)[-1]
+    try:
+        answers = dns.resolver.resolve(domain, "MX")
+    except dns.resolver.NoAnswer:
+        return [domain]
+    servers = [
+        (int(answer.preference), str(answer.exchange).rstrip("."))
+        for answer in answers
+        if str(answer.exchange) != "."
+    ]
+    return [server for _, server in sorted(servers)]
+
+
+def deliver_raw_email(recipient: str, raw_message: bytes) -> None:
+    servers = recipient_mail_servers(recipient)
+    if not servers:
+        raise RuntimeError("Empfängerdomain akzeptiert keine E-Mails (Null MX).")
+    last_error: Exception | None = None
+    for server in servers:
+        try:
+            with smtplib.SMTP(
+                server, 25, local_hostname=app.config["MAIL_HOSTNAME"], timeout=30
+            ) as smtp:
+                smtp.ehlo(app.config["MAIL_HOSTNAME"])
+                if smtp.has_extn("starttls"):
+                    smtp.starttls(context=ssl.create_default_context())
+                    smtp.ehlo(app.config["MAIL_HOSTNAME"])
+                smtp.sendmail(app.config["MAIL_FROM"], [recipient], raw_message)
+            return
+        except (OSError, smtplib.SMTPException) as exc:
+            last_error = exc
+    raise RuntimeError(f"Alle MX-Server fehlgeschlagen: {last_error}")
+
+
+def deliver_outbox_once() -> bool:
+    now = datetime.now(UTC)
+    with db() as conn:
+        row = conn.execute(
+            """SELECT * FROM mail_outbox
+               WHERE status = 'pending' AND next_attempt <= ?
+               ORDER BY id LIMIT 1""",
+            (now.isoformat(timespec="seconds"),),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            "UPDATE mail_outbox SET status = 'sending' WHERE id = ?", (row["id"],)
+        )
+    try:
+        deliver_raw_email(row["recipient"], row["message"])
+    except Exception as exc:  # delivery errors must remain in the persistent queue
+        attempts = row["attempts"] + 1
+        status = "failed" if attempts >= app.config["MAIL_MAX_ATTEMPTS"] else "pending"
+        retry_at = now + timedelta(minutes=min(2**attempts, 360))
+        with db() as conn:
+            conn.execute(
+                """UPDATE mail_outbox SET status = ?, attempts = ?,
+                   next_attempt = ?, last_error = ? WHERE id = ?""",
+                (
+                    status,
+                    attempts,
+                    retry_at.isoformat(timespec="seconds"),
+                    str(exc),
+                    row["id"],
+                ),
+            )
+        app.logger.warning(
+            "E-Mail %s konnte nicht zugestellt werden: %s", row["id"], exc
+        )
+    else:
+        with db() as conn:
+            conn.execute(
+                "UPDATE mail_outbox SET status = 'delivered', last_error = NULL WHERE id = ?",
+                (row["id"],),
+            )
+        app.logger.info("E-Mail %s an %s zugestellt.", row["id"], row["recipient"])
+    return True
+
+
+def mail_worker() -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE mail_outbox SET status = 'pending' WHERE status = 'sending'"
+        )
+    while True:
+        if not deliver_outbox_once():
+            time.sleep(app.config["MAIL_WORKER_INTERVAL"])
+
+
+def start_mail_server() -> threading.Thread:
+    _, dns_value = ensure_dkim_key()
+    app.logger.warning(
+        "Lokaler E-Mail-Zustelldienst gestartet. DKIM-TXT %s._domainkey.%s = %s",
+        app.config["DKIM_SELECTOR"],
+        app.config["MAIL_FROM"].rsplit("@", 1)[-1],
+        dns_value,
+    )
+    worker = threading.Thread(target=mail_worker, name="mail-delivery", daemon=True)
+    worker.start()
+    return worker
 
 
 def normalized_roles(roles: list[str]) -> list[str]:
@@ -1279,7 +1430,9 @@ def reset_initial_password(conn, user_id: int) -> str:
     recipient = user["email"] or default_email(user["first_name"], user["last_name"])
     if not user["email"]:
         conn.execute("UPDATE users SET email = ? WHERE id = ?", (recipient, user_id))
-    send_initial_credentials_email(user["username"], password, recipient)
+    send_initial_credentials_email(
+        user["username"], password, recipient, connection=conn
+    )
     return password
 
 
@@ -1894,4 +2047,5 @@ def ensure_database():
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=4010, debug=True)
+    start_mail_server()
+    app.run(host="0.0.0.0", port=4010, debug=True, use_reloader=False)

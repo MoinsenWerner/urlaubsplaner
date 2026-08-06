@@ -17,12 +17,11 @@ def client(tmp_path, monkeypatch):
         TESTING=True,
         SECRET_KEY="test",
         PROFILE_UPLOAD_FOLDER=str(tmp_path / "profile-images"),
-        SMTP_HOST="",
-        SMTP_USERNAME="",
-        SMTP_PASSWORD="",
-        SMTP_STARTTLS=True,
-        SMTP_SSL=False,
         MAIL_FROM="noreply@extrahelden.de",
+        MAIL_HOSTNAME="mail.extrahelden.de",
+        DKIM_SELECTOR="urlaubsplaner",
+        DKIM_PRIVATE_KEY=str(tmp_path / "dkim_private.pem"),
+        MAIL_MAX_ATTEMPTS=8,
         INITIAL_ADMIN_PASSWORD="admin",
     )
     vacation_app.init_db()
@@ -363,14 +362,19 @@ def test_init_db_backfills_only_missing_company_emails(client):
     assert rows[second_id] == "personal@example.org"
 
 
-def test_new_initial_credentials_are_sent_by_authenticated_starttls_smtp(
+def test_initial_credentials_are_dkim_signed_and_delivered_directly(
     client, monkeypatch
 ):
     sent = {}
 
     class FakeSmtp:
-        def __init__(self, host, port, timeout):
-            sent.update(host=host, port=port, timeout=timeout)
+        def __init__(self, host, port, local_hostname, timeout):
+            sent.update(
+                host=host,
+                port=port,
+                local_hostname=local_hostname,
+                timeout=timeout,
+            )
 
         def __enter__(self):
             return self
@@ -378,34 +382,48 @@ def test_new_initial_credentials_are_sent_by_authenticated_starttls_smtp(
         def __exit__(self, *_args):
             return None
 
-        def starttls(self):
+        def ehlo(self, hostname):
+            sent.setdefault("ehlo", []).append(hostname)
+
+        def has_extn(self, extension):
+            return extension == "starttls"
+
+        def starttls(self, context):
             sent["starttls"] = True
 
-        def login(self, username, password):
-            sent["login"] = (username, password)
+        def sendmail(self, from_addr, recipients, message):
+            sent.update(message=message, from_addr=from_addr, recipients=recipients)
 
-        def send_message(self, message, from_addr):
-            sent.update(message=message, from_addr=from_addr)
+    class MxAnswer:
+        preference = 10
+        exchange = "mx.m-a-i.de."
 
     monkeypatch.setattr(vacation_app.smtplib, "SMTP", FakeSmtp)
-    vacation_app.app.config.update(
-        SMTP_HOST="smtp.mail-provider.example",
-        SMTP_PORT=587,
-        SMTP_USERNAME="noreply@extrahelden.de",
-        SMTP_PASSWORD="smtp-secret",
+    monkeypatch.setattr(
+        vacation_app.dns.resolver, "resolve", lambda _domain, _kind: [MxAnswer()]
     )
     login(client)
     create_initial_member(client, username="mail.user")
+    with vacation_app.db() as conn:
+        queued = conn.execute("SELECT * FROM mail_outbox").fetchone()
+    assert queued["recipient"] == "mail.user.muster@m-a-i.de"
+    assert queued["message"].startswith(b"DKIM-Signature:")
+    assert b"https://urlaub.extrahelden.de/initial-login?token=" in queued["message"]
+
+    assert vacation_app.deliver_outbox_once() is True
 
     assert sent["starttls"] is True
-    assert sent["login"] == ("noreply@extrahelden.de", "smtp-secret")
+    assert sent["host"] == "mx.m-a-i.de"
+    assert sent["port"] == 25
+    assert sent["local_hostname"] == "mail.extrahelden.de"
     assert sent["from_addr"] == "noreply@extrahelden.de"
-    assert sent["message"]["To"] == "mail.user.muster@m-a-i.de"
-    assert sent["message"]["From"] == "Urlaubsplaner <noreply@extrahelden.de>"
-    assert (
-        "https://urlaub.extrahelden.de/initial-login?token="
-        in sent["message"].get_content()
-    )
+    assert sent["recipients"] == ["mail.user.muster@m-a-i.de"]
+    with vacation_app.db() as conn:
+        delivered = conn.execute(
+            "SELECT status, attempts FROM mail_outbox WHERE id = ?", (queued["id"],)
+        ).fetchone()
+    assert delivered["status"] == "delivered"
+    assert delivered["attempts"] == 0
 
 
 def test_profile_picture_appears_in_navbar_and_matrix_but_not_export(client):
