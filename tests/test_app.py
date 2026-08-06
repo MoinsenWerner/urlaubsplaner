@@ -17,6 +17,13 @@ def client(tmp_path, monkeypatch):
         TESTING=True,
         SECRET_KEY="test",
         PROFILE_UPLOAD_FOLDER=str(tmp_path / "profile-images"),
+        SMTP_HOST="",
+        SMTP_USERNAME="",
+        SMTP_PASSWORD="",
+        SMTP_STARTTLS=True,
+        SMTP_SSL=False,
+        MAIL_FROM="noreply@extrahelden.de",
+        INITIAL_ADMIN_PASSWORD="admin",
     )
     vacation_app.init_db()
     return vacation_app.app.test_client()
@@ -65,6 +72,10 @@ def test_admin_seed_and_login(client):
     response = login(client)
     assert response.status_code == 200
     assert b"Mitglieder verwalten" in response.data
+    client.get("/logout")
+    login_page = client.get("/login")
+    assert b"Initialer Admin" not in login_page.data
+    assert b"<code>admin</code>" not in login_page.data
 
 
 def test_admin_can_create_user_with_multiple_roles(client):
@@ -94,6 +105,7 @@ def test_admin_can_create_user_with_multiple_roles(client):
     password = vacation_app.reveal_initial_password(user)
     assert len(password) == 8
     assert user["must_change_password"] == 1
+    assert user["email"] == "max.muster@m-a-i.de"
     assert password.encode() in response.data
 
 
@@ -308,23 +320,92 @@ def test_bulk_roles_and_ausbilder_may_only_reset_azubi(client):
     )
 
 
-def test_profile_email_is_required_and_immutable(client):
+def test_profile_email_is_generated_and_immutable(client):
     login(client)
-    missing = client.post("/profile", data={"email": "", "birth_date": ""})
-    assert b"Pflichtangabe" in missing.data
+    profile = client.get("/profile")
+    assert b"admin.benutzer@m-a-i.de" in profile.data
     saved = client.post(
         "/profile",
         data={"email": "admin@example.de", "birth_date": "1990-04-12"},
         follow_redirects=True,
     )
-    assert b"admin@example.de" in saved.data
+    assert b"admin.benutzer@m-a-i.de" in saved.data
     client.post("/profile", data={"email": "changed@example.de", "birth_date": ""})
     with vacation_app.db() as conn:
         row = conn.execute(
             "SELECT email, birth_date FROM users WHERE id = 1"
         ).fetchone()
-    assert row["email"] == "admin@example.de"
+    assert row["email"] == "admin.benutzer@m-a-i.de"
     assert row["birth_date"] is None
+
+
+def test_init_db_backfills_only_missing_company_emails(client):
+    with vacation_app.db() as conn:
+        first_id = vacation_app.create_user(
+            conn, "missing.mail", "Mia", "Muster Frau", "password", ["normal"]
+        )
+        second_id = vacation_app.create_user(
+            conn, "manual.mail", "Manu", "Adresse", "password", ["normal"]
+        )
+        conn.execute("UPDATE users SET email = NULL WHERE id = ?", (first_id,))
+        conn.execute(
+            "UPDATE users SET email = 'personal@example.org' WHERE id = ?", (second_id,)
+        )
+    vacation_app.init_db()
+    with vacation_app.db() as conn:
+        rows = {
+            row["id"]: row["email"]
+            for row in conn.execute(
+                "SELECT id, email FROM users WHERE id IN (?, ?)", (first_id, second_id)
+            )
+        }
+    assert rows[first_id] == "mia.muster.frau@m-a-i.de"
+    assert rows[second_id] == "personal@example.org"
+
+
+def test_new_initial_credentials_are_sent_by_authenticated_starttls_smtp(
+    client, monkeypatch
+):
+    sent = {}
+
+    class FakeSmtp:
+        def __init__(self, host, port, timeout):
+            sent.update(host=host, port=port, timeout=timeout)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def starttls(self):
+            sent["starttls"] = True
+
+        def login(self, username, password):
+            sent["login"] = (username, password)
+
+        def send_message(self, message, from_addr):
+            sent.update(message=message, from_addr=from_addr)
+
+    monkeypatch.setattr(vacation_app.smtplib, "SMTP", FakeSmtp)
+    vacation_app.app.config.update(
+        SMTP_HOST="smtp.mail-provider.example",
+        SMTP_PORT=587,
+        SMTP_USERNAME="noreply@extrahelden.de",
+        SMTP_PASSWORD="smtp-secret",
+    )
+    login(client)
+    create_initial_member(client, username="mail.user")
+
+    assert sent["starttls"] is True
+    assert sent["login"] == ("noreply@extrahelden.de", "smtp-secret")
+    assert sent["from_addr"] == "noreply@extrahelden.de"
+    assert sent["message"]["To"] == "mail.user.muster@m-a-i.de"
+    assert sent["message"]["From"] == "Urlaubsplaner <noreply@extrahelden.de>"
+    assert (
+        "https://urlaub.extrahelden.de/initial-login?token="
+        in sent["message"].get_content()
+    )
 
 
 def test_profile_picture_appears_in_navbar_and_matrix_but_not_export(client):
@@ -675,6 +756,56 @@ def test_role_specific_mapping_controls_matrix_import_and_export(client, tmp_pat
     login(client, "mapping.normal", "password")
     assert b"AZRX" not in client.get("/").data
     assert client.get("/entry-mappings").status_code == 403
+
+
+def test_admin_can_delete_mapping_without_deleting_existing_entries(client):
+    login(client)
+    with vacation_app.db() as conn:
+        mapping = conn.execute(
+            "SELECT id FROM entry_mappings WHERE matrix_code = 'UB'"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO entries(user_id, entry_date, code, created_by) VALUES (1, ?, 'UB', 1)",
+            (date.today().isoformat(),),
+        )
+
+    response = client.post(
+        f"/entry-mappings/{mapping['id']}/delete", follow_redirects=True
+    )
+    assert response.status_code == 200
+    assert b"Zuordnung UB gel\xc3\xb6scht" in response.data
+    with vacation_app.db() as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM entry_mappings WHERE id = ?", (mapping["id"],)
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute("SELECT code FROM entries WHERE code = 'UB'").fetchone()[
+                "code"
+            ]
+            == "UB"
+        )
+
+
+def test_mapping_delete_is_admin_only_and_unknown_mapping_is_not_found(client):
+    login(client)
+    assert client.post("/entry-mappings/999999/delete").status_code == 404
+    with vacation_app.db() as conn:
+        mapping_id = conn.execute(
+            "SELECT id FROM entry_mappings WHERE matrix_code = 'UB'"
+        ).fetchone()["id"]
+        vacation_app.create_user(
+            conn, "mapping.normal.delete", "Mapping", "Normal", "password", ["normal"]
+        )
+    client.get("/logout")
+    login(client, "mapping.normal.delete", "password")
+    assert client.post(f"/entry-mappings/{mapping_id}/delete").status_code == 403
+    with vacation_app.db() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM entry_mappings WHERE id = ?", (mapping_id,)
+        ).fetchone()
 
 
 def test_repo_example_excel_imports_entries(client):

@@ -6,10 +6,13 @@ import hashlib
 import secrets
 import re
 import shutil
+import smtplib
 import sqlite3
 import subprocess
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 from io import BytesIO
 from pathlib import Path
 
@@ -143,6 +146,25 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-change-me")
 app.config["UPLOAD_FOLDER"] = "instance/uploads"
 app.config["PROFILE_UPLOAD_FOLDER"] = "instance/profile-images"
+app.config["PUBLIC_BASE_URL"] = os.environ.get(
+    "PUBLIC_BASE_URL", "https://urlaub.extrahelden.de"
+).rstrip("/")
+app.config["SMTP_HOST"] = os.environ.get("SMTP_HOST", "")
+app.config["SMTP_PORT"] = int(os.environ.get("SMTP_PORT", "587"))
+app.config["SMTP_USERNAME"] = os.environ.get("SMTP_USERNAME", "")
+app.config["SMTP_PASSWORD"] = os.environ.get("SMTP_PASSWORD", "")
+app.config["SMTP_STARTTLS"] = os.environ.get("SMTP_STARTTLS", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+app.config["SMTP_SSL"] = os.environ.get("SMTP_SSL", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+app.config["MAIL_FROM"] = os.environ.get("MAIL_FROM", "noreply@extrahelden.de")
+app.config["INITIAL_ADMIN_PASSWORD"] = os.environ.get("INITIAL_ADMIN_PASSWORD", "")
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
@@ -254,10 +276,22 @@ def init_db() -> None:
         for column, definition in migrations.items():
             if column not in columns:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+        for user in conn.execute(
+            "SELECT id, first_name, last_name FROM users WHERE email IS NULL OR TRIM(email) = ''"
+        ).fetchall():
+            conn.execute(
+                "UPDATE users SET email = ? WHERE id = ?",
+                (default_email(user["first_name"], user["last_name"]), user["id"]),
+            )
         seed_entry_mappings(conn)
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            admin_password = app.config["INITIAL_ADMIN_PASSWORD"] or initial_password()
             user_id = create_user(
-                conn, "admin", "Admin", "Benutzer", "admin", ["admin"]
+                conn, "admin", "Admin", "Benutzer", admin_password, ["admin"]
+            )
+            app.logger.warning(
+                "Initiale Admin-Zugangsdaten: Benutzername=admin Passwort=%s",
+                admin_password,
             )
             conn.execute(
                 "INSERT OR IGNORE INTO entries(user_id, entry_date, code, created_by) VALUES (?, ?, ?, ?)",
@@ -269,8 +303,15 @@ def create_user(
     conn, username: str, first: str, last: str, password: str, roles: list[str]
 ) -> int:
     cur = conn.execute(
-        "INSERT INTO users(username, first_name, last_name, password_hash) VALUES (?, ?, ?, ?)",
-        (username, first, last, generate_password_hash(password)),
+        """INSERT INTO users(username, first_name, last_name, password_hash, email)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            username,
+            first,
+            last,
+            generate_password_hash(password),
+            default_email(first, last),
+        ),
     )
     user_id = cur.lastrowid
     for role in normalized_roles(roles):
@@ -284,6 +325,12 @@ def initial_password() -> str:
     """Create an eight-character password without ambiguous characters."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
     return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def default_email(first: str, last: str) -> str:
+    """Build the company address without replacing valid international characters."""
+    local_part = ".".join(f"{first.strip()} {last.strip()}".casefold().split())
+    return f"{local_part}@m-a-i.de"
 
 
 def credential_cipher() -> Fernet:
@@ -300,15 +347,23 @@ def create_initial_user(
         """INSERT INTO users(
             username, first_name, last_name, password_hash,
             must_change_password, initial_password_encrypted,
-            initial_data_acknowledged
-        ) VALUES (?, ?, ?, ?, 1, ?, 0)""",
-        (username, first, last, generate_password_hash(password), encrypted),
+            initial_data_acknowledged, email
+        ) VALUES (?, ?, ?, ?, 1, ?, 0, ?)""",
+        (
+            username,
+            first,
+            last,
+            generate_password_hash(password),
+            encrypted,
+            default_email(first, last),
+        ),
     )
     user_id = cur.lastrowid
     for role in normalized_roles(roles):
         conn.execute(
             "INSERT INTO user_roles(user_id, role) VALUES (?, ?)", (user_id, role)
         )
+    send_initial_credentials_email(username, password, default_email(first, last))
     return user_id, password
 
 
@@ -321,7 +376,50 @@ def reveal_initial_password(row: sqlite3.Row) -> str:
 def initial_link(username: str, password: str) -> str:
     payload = f"{username}\0{password}".encode()
     token = credential_cipher().encrypt(payload).decode()
-    return f"https://urlaub.extrahelden.de/initial-login?token={token}"
+    return f"{app.config['PUBLIC_BASE_URL']}/initial-login?token={token}"
+
+
+def send_initial_credentials_email(
+    username: str, password: str, recipient: str
+) -> bool:
+    """Send the one-time setup link through an authenticated SMTP relay."""
+    if not app.config["SMTP_HOST"]:
+        app.logger.info(
+            "Initialdaten-E-Mail an %s nicht versendet: SMTP_HOST ist nicht gesetzt.",
+            recipient,
+        )
+        return False
+    link = initial_link(username, password)
+    message = EmailMessage()
+    message["Subject"] = "Dein Zugang zum Urlaubsplaner"
+    message["From"] = f"Urlaubsplaner <{app.config['MAIL_FROM']}>"
+    message["To"] = recipient
+    message["Date"] = formatdate(localtime=False)
+    message["Message-ID"] = make_msgid(domain=app.config["MAIL_FROM"].split("@")[-1])
+    message.set_content(
+        "Hallo,\n\n"
+        "für dich wurden neue Initialdaten im Urlaubsplaner erstellt. "
+        "Lege über diesen persönlichen Link dein Passwort fest:\n\n"
+        f"{link}\n\n"
+        "Falls du diese E-Mail nicht erwartet hast, wende dich bitte an einen Admin.\n"
+    )
+    try:
+        smtp_class = smtplib.SMTP_SSL if app.config["SMTP_SSL"] else smtplib.SMTP
+        with smtp_class(
+            app.config["SMTP_HOST"], app.config["SMTP_PORT"], timeout=15
+        ) as smtp:
+            if not app.config["SMTP_SSL"] and app.config["SMTP_STARTTLS"]:
+                smtp.starttls()
+            if app.config["SMTP_USERNAME"]:
+                smtp.login(app.config["SMTP_USERNAME"], app.config["SMTP_PASSWORD"])
+            smtp.send_message(message, from_addr=app.config["MAIL_FROM"])
+    except (OSError, smtplib.SMTPException):
+        app.logger.exception(
+            "Initialdaten-E-Mail an %s konnte nicht versendet werden.", recipient
+        )
+        return False
+    app.logger.info("Initialdaten-E-Mail an %s versendet.", recipient)
+    return True
 
 
 def normalized_roles(roles: list[str]) -> list[str]:
@@ -1140,6 +1238,22 @@ def entry_mappings():
     )
 
 
+@app.post("/entry-mappings/<int:mapping_id>/delete")
+@login_required
+def delete_entry_mapping(mapping_id: int):
+    if not current_user.has_role("admin"):
+        abort(403)
+    with db() as conn:
+        mapping = conn.execute(
+            "SELECT matrix_code FROM entry_mappings WHERE id = ?", (mapping_id,)
+        ).fetchone()
+        if not mapping:
+            abort(404)
+        conn.execute("DELETE FROM entry_mappings WHERE id = ?", (mapping_id,))
+    flash(f"Zuordnung {mapping['matrix_code']} gelöscht.")
+    return redirect(url_for("entry_mappings"))
+
+
 def member_password_target(conn, user_id: int) -> sqlite3.Row | None:
     target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     if not target:
@@ -1158,6 +1272,14 @@ def reset_initial_password(conn, user_id: int) -> str:
            initial_password_encrypted = ?, initial_data_acknowledged = 0 WHERE id = ?""",
         (generate_password_hash(password), encrypted, user_id),
     )
+    user = conn.execute(
+        "SELECT username, first_name, last_name, email FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    recipient = user["email"] or default_email(user["first_name"], user["last_name"])
+    if not user["email"]:
+        conn.execute("UPDATE users SET email = ? WHERE id = ?", (recipient, user_id))
+    send_initial_credentials_email(user["username"], password, recipient)
     return password
 
 
