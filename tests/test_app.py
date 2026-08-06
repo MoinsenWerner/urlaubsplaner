@@ -1,4 +1,6 @@
 from datetime import date
+from email import policy
+from email.parser import BytesParser
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -415,6 +417,17 @@ def test_initial_credentials_are_dkim_signed_and_delivered_directly(
     assert queued["recipient"] == "mail.user.muster@m-a-i.de"
     assert queued["message"].startswith(b"DKIM-Signature:")
     assert b"https://urlaub.extrahelden.de/initial-login?token=" in queued["message"]
+    assert b"\n" not in queued["message"].replace(b"\r\n", b"")
+    parsed = BytesParser(policy=policy.default).parsebytes(queued["message"])
+    assert parsed["Auto-Submitted"] == "auto-generated"
+    assert parsed["X-Auto-Response-Suppress"] == "All"
+    assert parsed.is_multipart()
+    assert (
+        "neue Initialdaten" in parsed.get_body(preferencelist=("plain",)).get_content()
+    )
+    html_body = parsed.get_body(preferencelist=("html",)).get_content()
+    assert "Passwort festlegen" in html_body
+    assert "https://urlaub.extrahelden.de/initial-login?token=" in html_body
 
     assert vacation_app.deliver_outbox_once() is True
 

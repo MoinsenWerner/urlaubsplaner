@@ -14,8 +14,10 @@ import threading
 import time
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
+from email import policy
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
+from html import escape
 from io import BytesIO
 from pathlib import Path
 
@@ -410,14 +412,34 @@ def send_initial_credentials_email(
     message["To"] = recipient
     message["Date"] = formatdate(localtime=False)
     message["Message-ID"] = make_msgid(domain=app.config["MAIL_FROM"].split("@")[-1])
-    message.set_content(
+    message["Auto-Submitted"] = "auto-generated"
+    message["X-Auto-Response-Suppress"] = "All"
+    plain_body = (
         "Hallo,\n\n"
         "für dich wurden neue Initialdaten im Urlaubsplaner erstellt. "
         "Lege über diesen persönlichen Link dein Passwort fest:\n\n"
         f"{link}\n\n"
         "Falls du diese E-Mail nicht erwartet hast, wende dich bitte an einen Admin.\n"
     )
-    raw_message = sign_email(message.as_bytes())
+    message.set_content(
+        plain_body, subtype="plain", charset="utf-8", cte="quoted-printable"
+    )
+    safe_link = escape(link, quote=True)
+    message.add_alternative(
+        """<!doctype html>
+<html lang="de"><body style="font-family:Arial,sans-serif;color:#17212b">
+<p>Hallo,</p>
+<p>für dich wurden neue Initialdaten im Urlaubsplaner erstellt.</p>
+<p><a href="{link}" style="display:inline-block;padding:12px 18px;background:#1769aa;color:#fff;text-decoration:none;border-radius:4px">Passwort festlegen</a></p>
+<p>Alternativ kannst du diesen Link kopieren:<br><a href="{link}">{link}</a></p>
+<p>Falls du diese E-Mail nicht erwartet hast, wende dich bitte an einen Admin.</p>
+</body></html>
+""".format(link=safe_link),
+        subtype="html",
+        charset="utf-8",
+        cte="quoted-printable",
+    )
+    raw_message = sign_email(message.as_bytes(policy=policy.SMTP))
     now = datetime.now(UTC).isoformat(timespec="seconds")
     if connection is not None:
         connection.execute(
@@ -470,7 +492,17 @@ def sign_email(raw_message: bytes) -> bytes:
         app.config["DKIM_SELECTOR"].encode(),
         domain,
         private_key,
-        include_headers=[b"from", b"to", b"subject", b"date", b"message-id"],
+        include_headers=[
+            b"from",
+            b"to",
+            b"subject",
+            b"date",
+            b"message-id",
+            b"mime-version",
+            b"content-type",
+            b"auto-submitted",
+            b"x-auto-response-suppress",
+        ],
     )
     return signature + raw_message
 
