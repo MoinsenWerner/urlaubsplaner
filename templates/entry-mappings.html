@@ -1,0 +1,39 @@
+{% extends 'base.html' %}{% block body %}
+<main class="page mapping-page">
+  <h1>Zuordnungen verwalten</h1>
+  <section class="card">
+    <h2>{% if edit_mapping %}Zuordnung bearbeiten{% else %}Neue Zuordnung erstellen{% endif %}</h2>
+    <form method="post" class="mapping-form">
+      {% if edit_mapping %}<input type="hidden" name="mapping_id" value="{{ edit_mapping.id }}">{% endif %}
+      <div class="mapping-grid">
+        <label>Kürzel aus Excel-Import<input name="import_code" value="{{ edit_mapping.import_code if edit_mapping else '' }}" required></label>
+        <label>Farbe in Matrix<input type="color" name="matrix_color" value="#{{ edit_mapping.matrix_color if edit_mapping else 'FFFFFF' }}" required></label>
+        <label>Kürzel in Matrix<input name="matrix_code" value="{{ edit_mapping.matrix_code if edit_mapping else '' }}" required></label>
+        <label>Buttonname/Legende für Matrix<input name="button_name" value="{{ edit_mapping.button_name if edit_mapping else '' }}" required></label>
+        <label>Kürzel im Export<input name="export_code" value="{{ edit_mapping.export_code if edit_mapping else '' }}" required></label>
+        <label>Farbe im Export<input type="color" name="export_color" value="#{{ edit_mapping.export_color if edit_mapping else 'FFFFFF' }}" required></label>
+        <label>Legendenbeschreibung im Export<input name="export_description" value="{{ edit_mapping.export_description if edit_mapping else '' }}" required></label>
+      </div>
+      <fieldset><legend>Sichtbar für Rollen</legend>
+        {% for role in roles %}{% set role_settings = edit_roles.get(role) %}<label><input type="checkbox" name="visible_roles" value="{{ role }}" {% if (role_settings and role_settings.visible) or (not edit_mapping and role == 'normal') %}checked{% endif %}> {{ role }}</label>{% endfor %}
+      </fieldset>
+      <h3>Rollenspezifische Abweichungen</h3>
+      <p>Leere Felder verwenden die allgemeinen Werte.</p>
+      <div class="role-overrides">
+        {% for role in roles %}{% set values = edit_roles.get(role) %}<fieldset><legend>{{ role }}</legend>
+          <label><input type="checkbox" name="{{ role }}__override" value="1" {% if values and (values.matrix_code or values.matrix_color or values.export_code or values.export_color) %}checked{% endif %}> Abweichende Werte verwenden</label>
+          <label>Kürzel Matrix<input name="{{ role }}__matrix_code" value="{{ values.matrix_code or '' if values else '' }}"></label>
+          <label>Farbe Matrix<input type="color" name="{{ role }}__matrix_color" value="#{% if values and values.matrix_color %}{{ values.matrix_color }}{% else %}{{ edit_mapping.matrix_color if edit_mapping else 'FFFFFF' }}{% endif %}"></label>
+          <label>Kürzel Export<input name="{{ role }}__export_code" value="{{ values.export_code or '' if values else '' }}"></label>
+          <label>Farbe Export<input type="color" name="{{ role }}__export_color" value="#{% if values and values.export_color %}{{ values.export_color }}{% else %}{{ edit_mapping.export_color if edit_mapping else 'FFFFFF' }}{% endif %}"></label>
+        </fieldset>{% endfor %}
+      </div>
+      <button class="primary">Speichern</button>{% if edit_mapping %}<a class="button" href="{{ url_for('entry_mappings') }}">Abbrechen</a>{% endif %}
+    </form>
+  </section>
+  <section class="card"><h2>Gespeicherte Zuordnungen</h2>
+    <div class="mapping-list"><table><thead><tr><th>Import</th><th>Matrix</th><th>Matrixfarbe</th><th>Button</th><th>Export</th><th>Exportfarbe</th><th>Beschreibung</th><th></th></tr></thead><tbody>
+      {% for mapping in mappings %}<tr><td>{{ mapping.import_code }}</td><td>{{ mapping.matrix_code }}</td><td><span class="color-preview" style="--preview:#{{ mapping.matrix_color }}"></span>#{{ mapping.matrix_color }}</td><td>{{ mapping.button_name }}</td><td>{{ mapping.export_code }}</td><td><span class="color-preview" style="--preview:#{{ mapping.export_color }}"></span>#{{ mapping.export_color }}</td><td>{{ mapping.export_description }}</td><td class="mapping-actions"><a class="button" href="{{ url_for('entry_mappings', edit=mapping.id) }}">Bearbeiten</a><form method="post" action="{{ url_for('delete_entry_mapping', mapping_id=mapping.id) }}" onsubmit="return confirm('Zuordnung {{ mapping.matrix_code }} wirklich löschen? Vorhandene Matrixeinträge mit diesem Kürzel bleiben gespeichert.')"><button class="danger" type="submit">Löschen</button></form></td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+</main>{% endblock %}
